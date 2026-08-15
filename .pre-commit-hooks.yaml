@@ -1,0 +1,12 @@
+- id: proofmark
+  name: proofmark (tests + coverage gates)
+  description: >-
+    Run the test suite with coverage, enforce the per-file coverage ratchet,
+    and require changed lines to be covered. Intended for the pre-push stage.
+  entry: proofmark run --check
+  language: python
+  # The gates are project-wide, so the hook must run once regardless of which
+  # files changed rather than once per file.
+  pass_filenames: false
+  always_run: true
+  stages: [pre-push]

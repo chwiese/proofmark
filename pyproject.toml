@@ -1,0 +1,102 @@
+[project]
+name = "proofmark"
+version = "0.1.0"
+description = "Test quality gates: per-file coverage ratchet, patch coverage, and mutation testing"
+readme = "README.md"
+requires-python = ">=3.14"
+# Empty by design, but note this is not the same as having no requirements:
+# proofmark drives pytest, diff-cover and mutmut as subprocesses through
+# `uv run`, so they are resolved from the dev dependencies of the project being
+# checked. See the Requirements section of README.md for why each tool lives
+# there. Keeping this list empty is what makes the pre-commit/prek isolated
+# environment a single small wheel.
+dependencies = []
+
+[project.scripts]
+proofmark = "proofmark.cli:main"
+
+[dependency-groups]
+dev = [
+    "diff-cover>=10.5",
+    "mutmut>=3.7",
+    "mypy>=2.3.0",
+    "pytest>=9.1",
+    "pytest-cov>=7.1",
+    "ruff>=0.16.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.proofmark]
+source = "src/proofmark"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["src/proofmark"]
+
+[tool.mutmut]
+source_paths = ["src/proofmark/"]
+pytest_add_cli_args_test_selection = ["tests/"]
+also_copy = ["tests/", "pyproject.toml"]
+mutate_only_covered_lines = true
+# Error message wording is not behaviour. Mutating these strings only produces
+# survivors that would be killed by asserting exact message text, which makes
+# the tests brittle for no gain - they already match on substrings.
+do_not_mutate_patterns = ["raise ConfigError\\("]
+
+[tool.mypy]
+python_version = "3.14"
+# mutmut copies the source tree into mutants/, which would otherwise make
+# `mypy .` fail with "Duplicate module named 'proofmark'". Unlike ruff, mypy
+# does not read .gitignore.
+exclude = ["^mutants/"]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_calls = true
+check_untyped_defs = true
+no_implicit_optional = true
+strict_equality = true
+warn_return_any = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unused_configs = true
+
+[tool.ruff.lint]
+extend-select = [
+    "ARG",  # Unused arguments
+    "B",  # Bugbear (potential bugs and security issues)
+    "C4",  # Comprehensions (inefficient patterns)
+    "C90",  # mccabe complexity
+    "D",  # All pydocstyle rules
+    "E",  # All Pycodestyle errors
+    "I",  # isort (import sorting)
+    "N",  # All pep8-naming rules
+    "SIM",  # Simplifications (code simplification suggestions)
+    "UP",  # pyupgrade (modernize syntax)
+    "W",  # All Pycodestyle warnings
+]
+ignore = [
+    "E501",  # Line too long (handled by formatter)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test doubles must match the signature they stand in for, so unused
+# arguments are expected. Test functions read fine without docstrings.
+"tests/*" = [
+    "D100",  # Missing docstring in public module
+    "D102",  # Missing docstring in public method
+    "D103",  # Missing docstring in public function
+    "D104",  # Missing docstring in public package
+    "D107",  # Missing docstring in __init__
+    "ARG001",  # Unused function argument
+    "ARG002",  # Unused method argument
+    "ARG005",  # Unused lambda argument
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"

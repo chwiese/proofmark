@@ -1,0 +1,12 @@
+{
+  "total": 96.51,
+  "measured": 315,
+  "files": {
+    "src/proofmark/__init__.py": 100.0,
+    "src/proofmark/__main__.py": 0.0,
+    "src/proofmark/cli.py": 96.72,
+    "src/proofmark/config.py": 98.84,
+    "src/proofmark/ratchet.py": 100.0,
+    "src/proofmark/runner.py": 98.02
+  }
+}

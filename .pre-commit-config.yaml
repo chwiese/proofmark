@@ -1,0 +1,39 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.1
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v2.3.0
+    hooks:
+      - id: mypy
+        # This hook runs mypy in an isolated virtualenv, so packages used in
+        # annotations must be listed here. Pinned to match uv.lock.
+        additional_dependencies:
+          - pytest>=9.1.1
+
+  - repo: local
+    hooks:
+      # proofmark checks itself. Using the local working copy rather than a
+      # pinned remote rev means a change to the gates is exercised by the very
+      # commit that makes it.
+      - id: proofmark
+        name: proofmark (tests + coverage gates)
+        entry: uv run proofmark run --check
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
