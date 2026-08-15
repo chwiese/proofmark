@@ -45,11 +45,25 @@ not a gain, so removals and a shrinking codebase pass.
 
 ### Deleting code does not count as a regression
 
-Removing well-covered code lowers the project average without anything getting
-worse: a file at 100% inside a project at 32% drags the mean down when it goes.
-proofmark records the measured size (statements + branches) alongside the total
-and skips the total gate when the codebase shrank. Nothing is hidden by this —
-a genuine drop still trips the per-file gate, which runs first.
+A coverage percentage is a ratio, so deleting lines moves it without anything
+having got better or worse. Removing well-covered code lowers the project
+average — a file at 100% inside a project at 32% drags the mean down when it
+goes — and removing uncovered code raises it, having earned nothing.
+
+proofmark records sizes, not just percentages, and asks the question in counts
+whenever something shrank: **did any line that was covered stop being
+covered?** If not, the change is a deletion and neither gate fires, in either
+direction. So dead-code removal never blocks a push.
+
+Nothing is hidden by this. Deleting the only caller of a helper shrinks the
+file *and* leaves the helper untested — the uncovered count goes up, and that
+still fails. It is only the arithmetic of the ratio that is forgiven.
+
+Sizes are why each file is recorded as `[missing, measured]` rather than a
+percentage; the percentage is derived from them, and is exact rather than
+rounded. A baseline written by an older proofmark is read as percentages and
+upgraded in place the next time it is written, so there is nothing to migrate
+by hand.
 
 ## Requirements
 

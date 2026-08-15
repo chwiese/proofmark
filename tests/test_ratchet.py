@@ -13,6 +13,8 @@ import pytest
 from proofmark.ratchet import (
     EPSILON,
     Baseline,
+    Counts,
+    Floor,
     RatchetError,
     Report,
     find_regressions,
@@ -25,23 +27,53 @@ from proofmark.ratchet import (
     write_baseline,
 )
 
+# A denominator large enough that every percentage these tests use is
+# reproduced exactly, so the EPSILON boundary cases still pin the boundary
+# rather than a rounding artefact.
+SCALE = 100_000
+
+
+def counts_for(percent: float) -> Counts:
+    """Counts whose ratio is exactly `percent`."""
+    return Counts(missing=round(SCALE * (100 - percent) / 100), measured=SCALE)
+
+
+def _as_counts(files: dict[str, float | Counts]) -> dict[str, Counts]:
+    """Let a test say either "this file is at 80%" or spell out the counts."""
+    return {
+        name: value if isinstance(value, Counts) else counts_for(value)
+        for name, value in files.items()
+    }
+
 
 def make_report(
-    files: dict[str, float] | None = None,
+    files: dict[str, float | Counts] | None = None,
     *,
     total: float = 50.0,
     measured: int = 1000,
 ) -> Report:
-    return Report(total=total, measured=measured, files=files or {})
+    return Report(total=total, measured=measured, files=_as_counts(files or {}))
 
 
 def make_baseline(
-    files: dict[str, float] | None = None,
+    files: dict[str, float | Counts] | None = None,
     *,
     total: float = 50.0,
     measured: int = 1000,
 ) -> Baseline:
-    return {"total": total, "measured": measured, "files": files or {}}
+    floors: dict[str, Floor] = dict(_as_counts(files or {}))
+    return {"total": total, "measured": measured, "files": floors}
+
+
+def make_legacy_baseline(
+    files: dict[str, float],
+    *,
+    total: float = 50.0,
+    measured: int = 1000,
+) -> Baseline:
+    """A baseline in the pre-sizes format, where a floor is a bare percentage."""
+    floors: dict[str, Floor] = dict(files)
+    return {"total": total, "measured": measured, "files": floors}
 
 
 def write_coverage_json(
@@ -61,7 +93,12 @@ def write_coverage_json(
                     "num_branches": branches,
                 },
                 "files": {
-                    name: {"summary": {"percent_covered": pct}}
+                    name: {
+                        "summary": {
+                            "covered_lines": SCALE - counts_for(pct).missing,
+                            "num_statements": SCALE,
+                        }
+                    }
                     for name, pct in files.items()
                 },
             }
@@ -122,21 +159,23 @@ def test_read_report_extracts_totals_and_files(tmp_path: Path) -> None:
 
     assert report.total == 42.5
     assert report.measured == 250  # statements + branches
-    assert report.files == {"a.py": 80.0}
+    assert report.files == {"a.py": counts_for(80.0)}
 
 
 def test_read_report_handles_a_report_without_branch_data(tmp_path: Path) -> None:
     """coverage.py omits the branch keys when branch coverage is not in effect.
 
     A project measuring statements only still produces a usable report, so
-    the missing key counts as zero branches rather than an error.
+    the missing keys count as zero branches rather than an error.
     """
     path = tmp_path / "coverage.json"
     path.write_text(
         json.dumps(
             {
                 "totals": {"percent_covered": 60.0, "num_statements": 300},
-                "files": {"a.py": {"summary": {"percent_covered": 60.0}}},
+                "files": {
+                    "a.py": {"summary": {"covered_lines": 6, "num_statements": 10}}
+                },
             }
         )
     )
@@ -144,6 +183,38 @@ def test_read_report_handles_a_report_without_branch_data(tmp_path: Path) -> Non
     report = read_report(path)
 
     assert report.measured == 300
+    assert report.files == {"a.py": Counts(missing=4, measured=10)}
+
+
+def test_branches_are_counted_alongside_statements(tmp_path: Path) -> None:
+    """The denominator coverage.py reports percentages against is both.
+
+    Counting statements alone would report a file with half its branches
+    untaken as fully covered.
+    """
+    path = tmp_path / "coverage.json"
+    path.write_text(
+        json.dumps(
+            {
+                "totals": {"percent_covered": 75.0, "num_statements": 8},
+                "files": {
+                    "a.py": {
+                        "summary": {
+                            "covered_lines": 10,
+                            "num_statements": 10,
+                            "covered_branches": 2,
+                            "num_branches": 6,
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    report = read_report(path)
+
+    assert report.files == {"a.py": Counts(missing=4, measured=16)}
+    assert report.files["a.py"].percent == pytest.approx(75.0)
 
 
 def test_read_report_rejects_missing_file(tmp_path: Path) -> None:
@@ -170,6 +241,28 @@ def test_excluded_files_are_dropped(tmp_path: Path) -> None:
     path = tmp_path / "coverage.json"
     write_counted_coverage_json(
         path, {"app.py": (50, 100), "tests/test_app.py": (100, 100)}
+    )
+
+    report = read_report(path, exclude=["tests"])
+
+    assert set(report.files) == {"app.py"}
+
+
+def test_a_windows_path_is_normalised_before_matching(tmp_path: Path) -> None:
+    """coverage.py writes paths with the platform separator."""
+    path = tmp_path / "coverage.json"
+    path.write_text(
+        json.dumps(
+            {
+                "totals": {"percent_covered": 100.0, "num_statements": 2},
+                "files": {
+                    "app.py": {"summary": {"covered_lines": 1, "num_statements": 1}},
+                    "tests\\test_app.py": {
+                        "summary": {"covered_lines": 1, "num_statements": 1}
+                    },
+                },
+            }
+        )
     )
 
     report = read_report(path, exclude=["tests"])
@@ -228,6 +321,91 @@ def test_excluding_the_whole_report_measures_nothing(tmp_path: Path) -> None:
     assert report.files == {}
     assert report.measured == 0
     assert report.total == 100.0  # coverage.py's own reading of "nothing to cover"
+
+
+# Deleting code from a file
+#
+# A file's percentage is a ratio, so removing lines moves it without anything
+# having got better or worse. Comparing ratios alone cannot tell a deletion
+# from an uncovering; comparing how many lines are uncovered can.
+
+
+def test_deleting_covered_code_is_not_a_regression() -> None:
+    """9 of 10 covered, then two covered lines deleted: 90% -> 87.5%.
+
+    The ratio fell because the denominator shrank. Nothing stopped being
+    tested, so failing here would penalise ordinary dead-code removal - the
+    thing the total gate already refuses to penalise.
+    """
+    report = make_report({"a.py": Counts(missing=1, measured=8)})
+    baseline = make_baseline({"a.py": Counts(missing=1, measured=10)})
+
+    assert find_regressions(report, baseline) == []
+
+
+def test_uncovering_a_line_while_deleting_others_is_a_regression() -> None:
+    """The case a bare size guard would miss.
+
+    Deleting the only caller of a helper shrinks the file and leaves the
+    helper untested. The file got smaller and worse at the same time.
+    """
+    report = make_report({"a.py": Counts(missing=3, measured=8)})
+    baseline = make_baseline({"a.py": Counts(missing=1, measured=10)})
+
+    (regression,) = find_regressions(report, baseline)
+
+    assert regression.path == "a.py"
+
+
+def test_deleting_uncovered_code_is_not_an_unrecorded_gain() -> None:
+    """Removing dead code raises the ratio without earning anything.
+
+    The mirror of the regression case: a push must not be blocked in either
+    direction for a change that only deletes.
+    """
+    report = make_report({"a.py": Counts(missing=0, measured=8)})
+    baseline = make_baseline({"a.py": Counts(missing=1, measured=10)})
+
+    assert find_unrecorded(report, baseline) == []
+
+
+def test_a_shrunk_file_does_not_hide_a_gain_in_another_file() -> None:
+    """Skipping a shrunk file must skip that file, not stop the scan."""
+    report = make_report(
+        {"shrank.py": Counts(missing=0, measured=8), "gained.py": 95.0}
+    )
+    baseline = make_baseline(
+        {"shrank.py": Counts(missing=1, measured=10), "gained.py": 50.0}
+    )
+
+    paths = [item.path for item in find_unrecorded(report, baseline)]
+
+    assert paths == ["gained.py"]
+
+
+def test_growth_at_an_identical_percentage_still_records_the_new_size() -> None:
+    """Sizes are what later tells a deletion from an uncovering.
+
+    Holding a stale size because the percentage happened not to move would
+    leave the file looking bigger than it is, and a later shrink back to that
+    size would go unnoticed.
+    """
+    report = make_report({"a.py": Counts(missing=2, measured=20)})
+    baseline = make_baseline({"a.py": Counts(missing=1, measured=10)})
+
+    updated = raise_baseline(report, baseline)
+
+    assert updated["files"]["a.py"] == Counts(missing=2, measured=20)
+
+
+def test_a_shrunk_file_still_records_its_new_size() -> None:
+    """A stale size would make the file look shrunk forever after."""
+    report = make_report({"a.py": Counts(missing=1, measured=8)})
+    baseline = make_baseline({"a.py": Counts(missing=1, measured=10)})
+
+    updated = raise_baseline(report, baseline)
+
+    assert updated["files"]["a.py"] == Counts(missing=1, measured=8)
 
 
 # Per-file gate
@@ -500,7 +678,7 @@ def test_baseline_records_improvements() -> None:
 
     updated = raise_baseline(report, baseline)
 
-    assert updated["files"]["a.py"] == 95.0
+    assert updated["files"]["a.py"] == counts_for(95.0)
     assert updated["total"] == 70.0
 
 
@@ -511,7 +689,7 @@ def test_baseline_never_lowers_a_file() -> None:
 
     updated = raise_baseline(report, baseline)
 
-    assert updated["files"]["a.py"] == 80.0
+    assert updated["files"]["a.py"] == counts_for(80.0)
 
 
 def test_baseline_adopts_lower_total_when_codebase_shrank() -> None:
@@ -553,7 +731,7 @@ def test_baseline_adds_new_files() -> None:
 
     updated = raise_baseline(report, baseline)
 
-    assert updated["files"]["new.py"] == 40.0
+    assert updated["files"]["new.py"] == counts_for(40.0)
 
 
 def test_a_brand_new_uncovered_file_gets_a_zero_floor() -> None:
@@ -567,7 +745,7 @@ def test_a_brand_new_uncovered_file_gets_a_zero_floor() -> None:
 
     updated = raise_baseline(report, baseline)
 
-    assert updated["files"]["untested.py"] == 0.0
+    assert updated["files"]["untested.py"] == counts_for(0.0)
 
 
 def test_baseline_keeps_the_higher_total_at_equal_size() -> None:
@@ -639,7 +817,107 @@ def test_baseline_round_trips(tmp_path: Path) -> None:
 
     assert restored["measured"] == 999
     assert restored["total"] == pytest.approx(61.23)
-    assert restored["files"]["b.py"] == pytest.approx(12.35)
+    # Counts are integers, so unlike a rounded percentage they survive exactly.
+    assert restored["files"]["b.py"] == counts_for(12.345)
+
+
+def test_baseline_is_valid_json(tmp_path: Path) -> None:
+    """The writer is hand-rolled to keep one file per line, so pin the shape."""
+    path = tmp_path / ".coverage-baseline.json"
+    write_baseline(path, make_baseline({"a.py": 50.0, "b.py": 100.0}, measured=7))
+
+    written = json.loads(path.read_text())
+
+    assert written["measured"] == 7
+    assert written["files"]["a.py"] == [counts_for(50.0).missing, SCALE]
+
+
+def test_an_empty_baseline_is_valid_json(tmp_path: Path) -> None:
+    """A project with nothing measured yet still has to write a readable file."""
+    path = tmp_path / ".coverage-baseline.json"
+    write_baseline(path, make_baseline())
+
+    assert json.loads(path.read_text())["files"] == {}
+
+
+def test_each_file_occupies_one_line(tmp_path: Path) -> None:
+    """Counts on separate lines would quadruple the committed diff."""
+    path = tmp_path / ".coverage-baseline.json"
+    write_baseline(path, make_baseline({"a.py": 1.0, "b.py": 2.0, "c.py": 3.0}))
+
+    assert sum("[" in line for line in path.read_text().splitlines()) == 3
+
+
+# Reading a baseline written before sizes were recorded
+
+
+def test_a_legacy_baseline_is_still_gated_on_percentages(tmp_path: Path) -> None:
+    """Upgrading must not silently drop the standard an old file recorded."""
+    path = tmp_path / ".coverage-baseline.json"
+    path.write_text(
+        json.dumps({"total": 50.0, "measured": 100, "files": {"a.py": 90.0}})
+    )
+
+    baseline = read_baseline(path)
+
+    assert baseline["files"]["a.py"] == 90.0
+    assert find_regressions(make_report({"a.py": 80.0}), baseline)
+    assert not find_regressions(make_report({"a.py": 95.0}), baseline)
+
+
+def test_a_legacy_entry_is_upgraded_on_the_next_write() -> None:
+    """Sizes can only start being recorded on a run that has them to record."""
+    report = make_report({"a.py": Counts(missing=1, measured=10)})
+
+    updated = raise_baseline(report, make_legacy_baseline({"a.py": 50.0}))
+
+    assert updated["files"]["a.py"] == Counts(missing=1, measured=10)
+
+
+def test_a_legacy_entry_cannot_have_its_size_compared() -> None:
+    """With no recorded size, a shrunk file falls back to the ratio.
+
+    Being stricter than necessary for one run is the safe direction: the write
+    that follows records the size and the next run gets the full treatment.
+    """
+    report = make_report({"a.py": Counts(missing=1, measured=8)})
+
+    assert find_regressions(report, make_legacy_baseline({"a.py": 90.0}))
+
+
+def test_a_legacy_floor_is_held_when_the_run_dipped_within_tolerance() -> None:
+    """The slow-leak guard, for an entry that has no counts to hold instead.
+
+    The gate passes inside EPSILON, so without this the sliver would be
+    written in and quietly become the new standard.
+    """
+    report = make_report({"a.py": Counts(missing=1, measured=1000)})  # 99.9%
+
+    updated = raise_baseline(report, make_legacy_baseline({"a.py": 99.905}))
+
+    assert updated["files"]["a.py"] == 99.905
+
+
+def test_a_held_legacy_floor_is_written_back_as_a_rounded_percentage(
+    tmp_path: Path,
+) -> None:
+    """Holding such a floor means writing it in the only form it has.
+
+    Rounded to two places like the total, so the committed file does not carry
+    a full float expansion into every diff.
+    """
+    path = tmp_path / ".coverage-baseline.json"
+    write_baseline(path, make_legacy_baseline({"a.py": 12.345}))
+
+    assert json.loads(path.read_text())["files"]["a.py"] == 12.35
+
+
+def test_an_unrecognised_baseline_entry_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / ".coverage-baseline.json"
+    path.write_text(json.dumps({"files": {"a.py": "most of it"}}))
+
+    with pytest.raises(ValueError, match="unrecognised baseline entry"):
+        read_baseline(path)
 
 
 def test_baseline_is_written_with_sorted_keys(tmp_path: Path) -> None:

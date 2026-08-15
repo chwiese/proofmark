@@ -28,12 +28,48 @@ class RatchetError(Exception):
     """Raised when coverage data is missing or unreadable."""
 
 
+@dataclass(frozen=True)
+class Counts:
+    """How much of one file is measurable, and how much of it is not covered.
+
+    Recorded as counts rather than a percentage because a percentage is a
+    ratio: deleting lines moves it without anything having got better or
+    worse. Only the uncovered count distinguishes a deletion from an
+    uncovering, and that distinction is what keeps the gate from penalising
+    dead-code removal.
+    """
+
+    missing: int
+    # Statements plus branches - the denominator behind the percentage.
+    measured: int
+
+    @property
+    def percent(self) -> float:
+        """The percentage covered."""
+        if self.measured == 0:
+            # coverage.py's reading of a file with nothing to cover.
+            return 100.0
+        return 100.0 * (self.measured - self.missing) / self.measured
+
+
+# One file's recorded standard. A bare float is an entry from a baseline
+# written before sizes were recorded: the percentage is known but the size is
+# not, so it falls back to comparing percentages until the next write upgrades
+# it in place.
+Floor = Counts | float
+
+
+def floor_percent(floor: Floor) -> float:
+    """Read the percentage out of a floor in either representation."""
+    return floor.percent if isinstance(floor, Counts) else floor
+
+
 class Baseline(TypedDict):
     """Committed coverage floors for one project."""
 
     total: float
     measured: int
-    files: dict[str, float]
+    files: dict[str, Floor]
 
 
 @dataclass(frozen=True)
@@ -44,7 +80,7 @@ class Report:
     # Statements plus branches - the denominator behind percent_covered.
     # Tracked so the total floor can be skipped when the codebase shrinks.
     measured: int
-    files: dict[str, float]
+    files: dict[str, Counts]
 
 
 @dataclass(frozen=True)
@@ -91,31 +127,42 @@ def _is_excluded(path: str, prefixes: Sequence[str]) -> bool:
     )
 
 
-def _summarise(summaries: Iterable[Mapping[str, float]]) -> tuple[float, int]:
-    """Recompute a total and measured size from per-file summaries.
+def _counts(summary: Mapping[str, float]) -> Counts:
+    """Read one file's counts out of its coverage.py summary block.
 
-    coverage.py's percentage is covered over measured, counting statements and
-    branches together, so summing the per-file numerators and denominators
-    reproduces exactly what it would have reported for this subset.
+    Statements and branches are added together, which is the denominator
+    coverage.py itself reports percentages against.
 
     Args:
-        summaries: The `summary` block of each file being counted.
+        summary: The `summary` block for one file.
+
+    Returns:
+        The file's uncovered and measurable counts.
+    """
+    # The branch keys are absent unless branch coverage is in effect.
+    covered = int(summary["covered_lines"]) + int(summary.get("covered_branches", 0))
+    measured = int(summary["num_statements"]) + int(summary.get("num_branches", 0))
+    return Counts(missing=measured - covered, measured=measured)
+
+
+def _summarise(counts: Iterable[Counts]) -> tuple[float, int]:
+    """Recompute a total and measured size from per-file counts.
+
+    Summing the numerators and denominators reproduces exactly what coverage.py
+    would have reported for this subset of files.
+
+    Args:
+        counts: The counts of each file being included.
 
     Returns:
         The percentage covered and the measured size.
     """
-    covered = 0
-    measured = 0
-    for summary in summaries:
-        # The branch keys are absent unless branch coverage is in effect.
-        covered += int(summary["covered_lines"]) + int(
-            summary.get("covered_branches", 0)
-        )
-        measured += int(summary["num_statements"]) + int(summary.get("num_branches", 0))
-    if measured == 0:
-        # coverage.py's reading of a project with nothing to cover.
-        return 100.0, 0
-    return 100.0 * covered / measured, measured
+    items = list(counts)  # iterated twice below
+    total = Counts(
+        missing=sum(item.missing for item in items),
+        measured=sum(item.measured for item in items),
+    )
+    return total.percent, total.measured
 
 
 def read_report(path: Path, exclude: Sequence[str] = ()) -> Report:
@@ -140,16 +187,12 @@ def read_report(path: Path, exclude: Sequence[str] = ()) -> Report:
 
     try:
         raw = json.loads(path.read_text())
-        summaries = {
-            name: data["summary"]
+        files = {
+            name: _counts(data["summary"])
             for name, data in raw["files"].items()
             if not _is_excluded(name, prefixes)
         }
-        files = {
-            name: float(summary["percent_covered"])
-            for name, summary in summaries.items()
-        }
-        if len(summaries) == len(raw["files"]):
+        if len(files) == len(raw["files"]):
             totals = raw["totals"]
             total = float(totals["percent_covered"])
             # coverage.py omits the branch keys entirely when branch coverage
@@ -161,10 +204,31 @@ def read_report(path: Path, exclude: Sequence[str] = ()) -> Report:
         else:
             # The totals block still counts the excluded files, so reusing it
             # would fold the test suite's own coverage into the project's.
-            total, measured = _summarise(summaries.values())
+            total, measured = _summarise(files.values())
         return Report(total=total, measured=measured, files=files)
     except (KeyError, TypeError, ValueError) as exc:
         raise RatchetError(f"could not parse {path.name}: {exc}") from exc
+
+
+def _read_floor(entry: object) -> Floor:
+    """Parse one recorded floor, accepting either representation.
+
+    A two-element list is the current form, `[missing, measured]`. A bare
+    number is an entry written before sizes were recorded; it is kept as a
+    percentage rather than guessed at, since no choice of size reproduces it
+    faithfully.
+
+    Args:
+        entry: The value recorded against one file.
+
+    Returns:
+        The floor.
+    """
+    if isinstance(entry, list) and len(entry) == 2:
+        return Counts(missing=int(entry[0]), measured=int(entry[1]))
+    if isinstance(entry, int | float):
+        return float(entry)
+    raise ValueError(f"unrecognised baseline entry: {entry!r}")
 
 
 def read_baseline(path: Path) -> Baseline:
@@ -183,26 +247,42 @@ def read_baseline(path: Path) -> Baseline:
     return {
         "total": float(raw.get("total", 0.0)),
         "measured": int(raw.get("measured", 0)),
-        "files": {name: float(pct) for name, pct in raw.get("files", {}).items()},
+        "files": {
+            name: _read_floor(entry) for name, entry in raw.get("files", {}).items()
+        },
     }
+
+
+def _render_floor(floor: Floor) -> str:
+    """Serialise one floor onto a single line."""
+    if isinstance(floor, Counts):
+        return f"[{floor.missing}, {floor.measured}]"
+    return json.dumps(round(floor, 2))
 
 
 def write_baseline(path: Path, baseline: Baseline) -> None:
     """Write the baseline with stable key ordering so diffs stay readable.
 
+    Rendered by hand rather than with `json.dumps(indent=2)`, which would put
+    each count on its own line and turn a one-line-per-file record into four.
+    The baseline is committed, so how it diffs is part of its job.
+
     Args:
         path: Destination path.
         baseline: The baseline to serialise.
     """
-    payload = {
-        "total": round(baseline["total"], 2),
-        "measured": baseline["measured"],
-        "files": {
-            name: round(baseline["files"][name], 2)
-            for name in sorted(baseline["files"])
-        },
-    }
-    path.write_text(json.dumps(payload, indent=2) + "\n")
+    entries = ",\n".join(
+        f"    {json.dumps(name)}: {_render_floor(baseline['files'][name])}"
+        for name in sorted(baseline["files"])
+    )
+    files = f"{{\n{entries}\n  }}" if entries else "{}"
+    path.write_text(
+        "{\n"
+        f'  "total": {json.dumps(round(baseline["total"], 2))},\n'
+        f'  "measured": {json.dumps(baseline["measured"])},\n'
+        f'  "files": {files}\n'
+        "}\n"
+    )
 
 
 def find_regressions(report: Report, baseline: Baseline) -> list[Regression]:
@@ -219,12 +299,39 @@ def find_regressions(report: Report, baseline: Baseline) -> list[Regression]:
         Regressions, worst drop first.
     """
     regressions = [
-        Regression(path=name, baseline=floor, current=report.files[name])
+        Regression(
+            path=name, baseline=floor_percent(floor), current=report.files[name].percent
+        )
         for name, floor in baseline["files"].items()
         # A missing file was deleted or renamed; it drops out of the baseline.
-        if name in report.files and report.files[name] < floor - EPSILON
+        if name in report.files and _file_regressed(report.files[name], floor)
     ]
     return sorted(regressions, key=lambda item: item.drop, reverse=True)
+
+
+def _file_regressed(current: Counts, floor: Floor) -> bool:
+    """Decide whether one file got worse, rather than merely smaller.
+
+    A percentage is a ratio, so deleting covered lines lowers it without
+    anything having stopped being tested. Comparing percentages alone would
+    fail a push for removing dead code - the very thing total_regressed is
+    written to avoid, one level down.
+
+    When the file has shrunk the question is asked in counts instead: did any
+    line that was covered stop being covered? That catches the case a bare
+    size guard would miss, where deleting the only caller of a helper both
+    shrinks the file and leaves the helper untested.
+
+    Args:
+        current: The file's counts in this run.
+        floor: Its recorded standard.
+
+    Returns:
+        True if the file regressed.
+    """
+    if isinstance(floor, Counts) and current.measured < floor.measured:
+        return current.missing > floor.missing
+    return current.percent < floor_percent(floor) - EPSILON
 
 
 def total_regressed(report: Report, baseline: Baseline) -> bool:
@@ -259,9 +366,11 @@ def find_unrecorded(report: Report, baseline: Baseline) -> list[Unrecorded]:
     hold in a hook: a gain that is not written down is protected by nothing,
     and giving it back later trips no gate.
 
-    Baseline entries missing from the report are deletions rather than gains,
-    and are deliberately not reported - failing a push for removing a file
-    would protect nothing.
+    Deletions are not gains, in either of the two shapes they take. A baseline
+    entry missing from the report is a removed file. A file that shrank has a
+    higher ratio only because its denominator fell - nothing was earned by it,
+    and failing a push for removing dead code would be the same false positive
+    the regression gate refuses to raise.
 
     Args:
         report: The current coverage report.
@@ -274,9 +383,17 @@ def find_unrecorded(report: Report, baseline: Baseline) -> list[Unrecorded]:
     for name, current in report.files.items():
         floor = baseline["files"].get(name)
         if floor is None:
-            gains.append(Unrecorded(path=name, baseline=None, current=current))
-        elif current > floor + EPSILON:
-            gains.append(Unrecorded(path=name, baseline=floor, current=current))
+            gains.append(Unrecorded(path=name, baseline=None, current=current.percent))
+        elif isinstance(floor, Counts) and current.measured < floor.measured:
+            continue
+        elif current.percent > floor_percent(floor) + EPSILON:
+            gains.append(
+                Unrecorded(
+                    path=name,
+                    baseline=floor_percent(floor),
+                    current=current.percent,
+                )
+            )
     return sorted(gains, key=lambda item: item.gain, reverse=True)
 
 
@@ -299,6 +416,33 @@ def total_unrecorded(report: Report, baseline: Baseline) -> bool:
     return report.total > baseline["total"] + EPSILON
 
 
+def _raise_floor(current: Counts, floor: Floor | None) -> Floor:
+    """Build one file's next floor, never lowering the standard it records.
+
+    A shrunk file adopts the current counts outright, for the same reason the
+    total does: they are a matched snapshot, and holding a percentage measured
+    against a size the file no longer has would leave it looking shrunk on
+    every later run and never recording anything again.
+
+    Args:
+        current: The file's counts in this run.
+        floor: Its recorded standard, or None if it is not tracked yet.
+
+    Returns:
+        The floor to record.
+    """
+    if floor is None:
+        return current
+    if isinstance(floor, Counts) and current.measured < floor.measured:
+        return current
+    if current.percent >= floor_percent(floor):
+        return current
+    # Hold the higher standard: callers only reach here once the gate has
+    # passed, so this is the sub-EPSILON sliver that would otherwise be
+    # written in and become the new normal.
+    return floor
+
+
 def raise_baseline(report: Report, baseline: Baseline) -> Baseline:
     """Build the next baseline, keeping the higher of old and new per file.
 
@@ -315,8 +459,8 @@ def raise_baseline(report: Report, baseline: Baseline) -> Baseline:
         The updated baseline.
     """
     files = {
-        name: max(pct, baseline["files"].get(name, 0.0))
-        for name, pct in report.files.items()
+        name: _raise_floor(current, baseline["files"].get(name))
+        for name, current in report.files.items()
     }
     shrank = report.measured < baseline["measured"]
     return {

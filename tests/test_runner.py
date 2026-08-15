@@ -27,6 +27,10 @@ def config(tmp_path: Path) -> Config:
     )
 
 
+# A denominator large enough to reproduce these percentages exactly.
+SCALE = 100_000
+
+
 def write_report(
     config: Config, *, total: float, measured: int, files: dict[str, float]
 ) -> None:
@@ -39,7 +43,12 @@ def write_report(
                     "num_branches": 0,
                 },
                 "files": {
-                    name: {"summary": {"percent_covered": pct}}
+                    name: {
+                        "summary": {
+                            "covered_lines": round(SCALE * pct / 100),
+                            "num_statements": SCALE,
+                        }
+                    }
                     for name, pct in files.items()
                 },
             }
@@ -262,7 +271,8 @@ def test_update_mode_raises_the_baseline(config: Config) -> None:
 
     runner.check_ratchet(config, update=True)
 
-    assert json.loads(config.baseline.read_text())["files"]["a.py"] == 90.0
+    missing, measured = json.loads(config.baseline.read_text())["files"]["a.py"]
+    assert 100.0 * (measured - missing) / measured == 90.0
 
 
 def test_update_mode_seeds_a_missing_baseline(config: Config) -> None:
