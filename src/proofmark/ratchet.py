@@ -40,8 +40,8 @@ class Report:
     """A parsed coverage.py JSON report."""
 
     total: float
-    #: Statements plus branches - the denominator behind percent_covered.
-    #: Tracked so the total floor can be skipped when the codebase shrinks.
+    # Statements plus branches - the denominator behind percent_covered.
+    # Tracked so the total floor can be skipped when the codebase shrinks.
     measured: int
     files: dict[str, float]
 

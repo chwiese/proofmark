@@ -9,6 +9,12 @@ from proofmark import runner
 from proofmark.config import Config, ConfigError, load
 from proofmark.ratchet import RatchetError
 
+# pytest's exit status when it collected nothing at all. For a ratchet, an
+# empty suite is a legitimate starting state rather than a failure: seeding a
+# baseline at zero is exactly how a project adopts the gate before it has
+# written its first test.
+PYTEST_NO_TESTS_COLLECTED = 5
+
 
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the argument parser."""
@@ -61,7 +67,13 @@ def _run(config: Config, *, check_only: bool, mutants: bool) -> int:
         A process exit status.
     """
     runner.status("Running test suite with coverage...")
-    if (code := runner.run_pytest(config)) != 0:
+    code = runner.run_pytest(config)
+    if code == PYTEST_NO_TESTS_COLLECTED:
+        runner.warn(
+            "No tests collected - seeding the baseline from an empty suite.\n"
+            "    Coverage can only go up from here."
+        )
+    elif code != 0:
         runner.fail("Tests failed")
         return code
 

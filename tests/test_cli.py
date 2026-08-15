@@ -82,6 +82,23 @@ def test_failing_tests_skip_the_gates(
     assert stub_gates == []
 
 
+def test_an_empty_suite_still_seeds_the_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_gates: list[str],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A project with no tests yet is adopting the ratchet, not failing it.
+
+    pytest exits 5 when it collects nothing. Treating that as a failure would
+    make the gate impossible to install before the first test exists.
+    """
+    monkeypatch.setattr(runner, "run_pytest", lambda c: cli.PYTEST_NO_TESTS_COLLECTED)
+
+    assert cli.main(["run"]) == 0
+    assert "ratchet(update=True)" in stub_gates
+    assert "No tests collected" in capsys.readouterr().out
+
+
 def test_ratchet_failure_skips_diff_coverage(
     monkeypatch: pytest.MonkeyPatch, stub_gates: list[str]
 ) -> None:

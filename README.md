@@ -78,7 +78,10 @@ environment a single small wheel that builds in well under a second.
 
 ## Use as a pre-push hook
 
-Add to `.pre-commit-config.yaml`:
+Add to `.pre-commit-config.yaml`, using whichever remote protocol you normally
+clone with.
+
+Over HTTPS:
 
 ```yaml
 repos:
@@ -88,6 +91,23 @@ repos:
       - id: proofmark
         stages: [pre-push]
 ```
+
+Over SSH:
+
+```yaml
+repos:
+  - repo: git@github.com:chwiese/proofmark.git
+    rev: v0.1.0
+    hooks:
+      - id: proofmark
+        stages: [pre-push]
+```
+
+The two are equivalent, with one caveat if the repository is private: pre-commit
+and prek clone hook repositories non-interactively, so HTTPS needs a git
+credential helper already configured (`gh auth setup-git` sets one up) or the
+clone fails with `could not read Username for 'https://github.com'`. SSH works
+as long as your key is set up.
 
 Then install the stage — `pre-commit install` alone does not cover it:
 
