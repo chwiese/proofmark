@@ -1,6 +1,6 @@
 [project]
 name = "proofmark"
-version = "0.1.0"
+version = "0.2.0"
 description = "Test quality gates: per-file coverage ratchet, patch coverage, and mutation testing"
 readme = "README.md"
 requires-python = ">=3.14"
