@@ -14,7 +14,7 @@ import pytest
 
 from proofmark import runner
 from proofmark.config import Config
-from proofmark.ratchet import Regression
+from proofmark.ratchet import Regression, Unrecorded
 
 
 @pytest.fixture
@@ -272,6 +272,170 @@ def test_update_mode_seeds_a_missing_baseline(config: Config) -> None:
     assert config.baseline.exists()
 
 
+def test_gate_ignores_excluded_paths(tmp_path: Path) -> None:
+    """The test suite's own coverage must not be folded into the project's."""
+    config = Config(
+        root=tmp_path,
+        source=".",
+        diff_threshold=80,
+        compare_branch="origin/main",
+        exclude=("tests",),
+    )
+    config.coverage_json.write_text(
+        json.dumps(
+            {
+                "totals": {
+                    "percent_covered": 75.0,
+                    "num_statements": 200,
+                    "num_branches": 0,
+                },
+                "files": {
+                    "app.py": {
+                        "summary": {
+                            "percent_covered": 50.0,
+                            "covered_lines": 50,
+                            "num_statements": 100,
+                        }
+                    },
+                    "tests/test_app.py": {
+                        "summary": {
+                            "percent_covered": 100.0,
+                            "covered_lines": 100,
+                            "num_statements": 100,
+                        }
+                    },
+                },
+            }
+        )
+    )
+
+    assert runner.check_ratchet(config, update=True) == 0
+
+    written = json.loads(config.baseline.read_text())
+    assert list(written["files"]) == ["app.py"]
+    assert written["total"] == 50.0
+    assert written["measured"] == 100
+
+
+# Staleness gate
+#
+# The hook runs --check, which never writes. Without this gate a project can
+# earn coverage, never commit it, and keep being told "All checks passed"
+# while the recorded standard sits at whatever it was first seeded with.
+
+
+def test_check_mode_fails_on_an_unrecorded_gain(
+    config: Config, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_report(config, total=90.0, measured=100, files={"a.py": 90.0})
+    config.baseline.write_text(
+        json.dumps({"total": 50.0, "measured": 100, "files": {"a.py": 50.0}})
+    )
+
+    assert runner.check_ratchet(config, update=False) == 1
+
+    out = capsys.readouterr().out
+    assert "a.py" in out
+    assert "proofmark run" in out
+
+
+def test_check_mode_fails_on_an_untracked_file(config: Config) -> None:
+    """The case that let actual_data_munging rot: measured but never recorded."""
+    write_report(config, total=50.0, measured=100, files={"a.py": 50.0, "new.py": 80.0})
+    config.baseline.write_text(
+        json.dumps({"total": 50.0, "measured": 100, "files": {"a.py": 50.0}})
+    )
+
+    assert runner.check_ratchet(config, update=False) == 1
+
+
+def test_check_mode_reports_a_missing_baseline(
+    config: Config, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Listing every file would be noise - the whole project is the gain."""
+    write_report(config, total=90.0, measured=100, files={"a.py": 90.0})
+
+    assert runner.check_ratchet(config, update=False) == 1
+
+    out = capsys.readouterr().out
+    assert "No baseline" in out
+    assert "proofmark check --update" in out
+    assert "a.py" not in out
+
+
+def test_check_mode_passes_on_a_current_baseline(config: Config) -> None:
+    write_report(config, total=90.0, measured=100, files={"a.py": 90.0})
+    config.baseline.write_text(
+        json.dumps({"total": 90.0, "measured": 100, "files": {"a.py": 90.0}})
+    )
+
+    assert runner.check_ratchet(config, update=False) == 0
+
+
+def test_check_mode_tolerates_a_deleted_file(config: Config) -> None:
+    """A stale entry for removed code is not a gain, and must not fail a push."""
+    write_report(config, total=90.0, measured=80, files={"a.py": 90.0})
+    config.baseline.write_text(
+        json.dumps(
+            {"total": 90.0, "measured": 100, "files": {"a.py": 90.0, "gone.py": 100.0}}
+        )
+    )
+
+    assert runner.check_ratchet(config, update=False) == 0
+
+
+def test_check_mode_tolerates_a_shrinking_codebase(config: Config) -> None:
+    """Deleting poorly covered code raises the average without earning it."""
+    write_report(config, total=95.0, measured=80, files={"a.py": 90.0})
+    config.baseline.write_text(
+        json.dumps({"total": 90.0, "measured": 100, "files": {"a.py": 90.0}})
+    )
+
+    assert runner.check_ratchet(config, update=False) == 0
+
+
+def test_a_regression_is_reported_alone(
+    config: Config, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A drop is the more serious finding; the staleness table would bury it."""
+    write_report(config, total=50.0, measured=100, files={"a.py": 10.0, "b.py": 99.0})
+    config.baseline.write_text(
+        json.dumps(
+            {"total": 50.0, "measured": 100, "files": {"a.py": 90.0, "b.py": 50.0}}
+        )
+    )
+
+    assert runner.check_ratchet(config, update=False) == 1
+    assert "out of date" not in capsys.readouterr().out
+
+
+def test_check_mode_fails_on_a_total_the_files_do_not_explain(
+    config: Config, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A hand-edited or truncated baseline can hold floors but lose the total.
+
+    Every file is at its floor here, so only the total says the record is
+    behind - and it still has to be brought up to date.
+    """
+    write_report(config, total=90.0, measured=100, files={"a.py": 90.0})
+    config.baseline.write_text(
+        json.dumps({"total": 50.0, "measured": 100, "files": {"a.py": 90.0}})
+    )
+
+    assert runner.check_ratchet(config, update=False) == 1
+    assert "out of date" in capsys.readouterr().out
+
+
+def test_update_mode_records_instead_of_failing(config: Config) -> None:
+    """The writing path answers staleness by fixing it, so it must not gate."""
+    write_report(config, total=90.0, measured=100, files={"a.py": 90.0})
+    config.baseline.write_text(
+        json.dumps({"total": 50.0, "measured": 100, "files": {"a.py": 50.0}})
+    )
+
+    assert runner.check_ratchet(config, update=True) == 0
+
+
 # Regression report
 
 
@@ -306,6 +470,71 @@ def test_regression_table_names_the_baseline_file(
     runner._print_regressions([Regression("a.py", 90.0, 80.0)])
 
     assert ".coverage-baseline.json" in capsys.readouterr().out
+
+
+# Unrecorded gain report
+
+
+def test_unrecorded_table_aligns_to_the_longest_path(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runner._print_unrecorded(
+        [
+            Unrecorded("a/very/long/path/to/a/module.py", 10.0, 100.0),
+            Unrecorded("short.py", 80.0, 90.0),
+        ],
+        recorded_total=50.0,
+        current_total=95.0,
+    )
+
+    lines = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if "%" in line and "Total" not in line
+    ]
+    assert len({len(line.rstrip()) for line in lines}) == 1
+
+
+def test_unrecorded_table_shows_the_gain_as_positive(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runner._print_unrecorded(
+        [Unrecorded("a.py", 80.0, 90.0)], recorded_total=80.0, current_total=90.0
+    )
+
+    out = capsys.readouterr().out
+    assert "80.00%" in out
+    assert "90.00%" in out
+    assert "+10.00" in out
+
+
+def test_unrecorded_table_marks_an_untracked_file(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An untracked file has no floor at all, which is worth saying plainly."""
+    runner._print_unrecorded(
+        [Unrecorded("new.py", None, 40.0)], recorded_total=0.0, current_total=40.0
+    )
+
+    assert "(new)" in capsys.readouterr().out
+
+
+def test_unrecorded_table_leads_with_the_cheap_remedy(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The report on disk is the one these numbers came from.
+
+    Re-running the suite is wasted work, and re-measuring could land on
+    numbers other than the ones the table just showed.
+    """
+    runner._print_unrecorded(
+        [Unrecorded("a.py", 80.0, 90.0)], recorded_total=80.0, current_total=90.0
+    )
+
+    out = capsys.readouterr().out
+    assert "proofmark check --update" in out
+    assert out.index("check --update") < out.index("proofmark run")
+    assert ".coverage-baseline.json" in out
 
 
 # Diff coverage gate

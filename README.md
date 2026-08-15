@@ -38,6 +38,11 @@ If a coverage gain is never recorded, a later change can give it back
 unnoticed — the "broken ratchet". Committing the baseline makes each gain
 permanent, and makes any deliberate reduction show up in review as a diff.
 
+This is also why `--check` fails when the baseline is behind what the suite
+actually achieves. A gain nobody wrote down is protected by nothing: the number
+pytest just printed is not a standard, the committed one is. Deleting code is
+not a gain, so removals and a shrinking codebase pass.
+
 ### Deleting code does not count as a regression
 
 Removing well-covered code lowers the project average without anything getting
@@ -117,6 +122,16 @@ prek install --hook-type pre-push     # or: pre-commit install --hook-type pre-p
 
 Commits stay fast; the suite and both gates run on `git push`.
 
+The hook runs `--check`, which never writes the baseline — a pre-push hook
+cannot add a file to the commit you are already pushing. Instead it fails if
+the baseline is out of date. Without that it would report success while the
+recorded standard quietly stayed at whatever it was first seeded with, gating
+nothing.
+
+Recovering costs one command and no second test run: the failing hook has
+already written `coverage.json`, so `proofmark check --update` records exactly
+the numbers it just showed you. Commit the baseline and push again.
+
 ## Use directly
 
 ```bash
@@ -140,6 +155,7 @@ Everything is optional. Put overrides in the project's `pyproject.toml`:
 source = "mypackage"            # pytest --cov target
 diff_threshold = 80             # percent of changed lines that must be covered
 compare_branch = "origin/main"  # what "changed" is measured against
+exclude = ["tests", "mutants"]  # directories the ratchet ignores
 ```
 
 `source` is inferred when omitted: the project name from `[project]`, with
@@ -147,11 +163,19 @@ dashes converted to underscores, if `<name>/` or `src/<name>/` exists —
 otherwise `.`, which suits projects that are flat modules at the repository
 root.
 
+`exclude` is inferred too, but only for that flat case. Measuring `.` sweeps
+the test suite in alongside the code, and a committed floor on a test file
+records nothing anyone would act on. proofmark takes `testpaths` from
+`[tool.pytest.ini_options]`, or failing that whichever of `tests/` and `test/`
+exists. Setting `exclude` yourself replaces that inference rather than adding
+to it. A project whose coverage is scoped to a package excludes nothing by
+default, because it never measured its tests to begin with.
+
 If the compare branch does not exist locally, the diff coverage gate is skipped
 with a warning rather than failing.
 
 ## First run
 
-The first `proofmark run` in a project writes `.coverage-baseline.json` from
-whatever coverage currently exists. Commit it. From then on the number can only
-go up.
+`proofmark run` writes `.coverage-baseline.json` from whatever coverage
+currently exists. Commit it. From then on the number can only go up — and until
+you do, `--check` fails rather than passing a project nothing is gating.

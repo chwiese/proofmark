@@ -156,6 +156,102 @@ def _print_regressions(regressions: Sequence[ratchet.Regression]) -> None:
     )
 
 
+def _how_to_record(verb: str) -> str:
+    """Spell out the remedy for a baseline that has fallen behind.
+
+    `check --update` leads because the report on disk is the one these numbers
+    were just read from - it records exactly what was reported, and costs
+    nothing. Every route to this message has already written that report.
+    `run` re-measures, which is what you want only if the tree has moved since.
+
+    Args:
+        verb: How to open the sentence, "Record" or "Create".
+
+    Returns:
+        An indented block ready to print.
+    """
+    return (
+        f"  {verb} it with: proofmark check --update, which records the\n"
+        f"  report already measured - or proofmark run to re-measure first.\n"
+        f"  Then commit {BASELINE_NAME}."
+    )
+
+
+def _print_unrecorded(
+    unrecorded: Sequence[ratchet.Unrecorded],
+    *,
+    recorded_total: float,
+    current_total: float,
+) -> None:
+    """Report coverage the project has earned but never committed.
+
+    Laid out like the regression table, since the question is the same one in
+    reverse: how far the committed standard has fallen behind what the suite
+    actually achieves.
+    """
+    width = max(len(item.path) for item in unrecorded)
+    width = max(width, len("FILE"))
+
+    print(f"{BASELINE_NAME} is out of date - these gains are not recorded\n")
+    print(f"  {'FILE':<{width}}  {'BASELINE':>9}  {'NOW':>9}  {'GAIN':>8}")
+    print(f"  {'─' * (width + 32)}")
+    for item in unrecorded:
+        # An untracked file has no floor at all, rather than a floor of zero.
+        floor = "(new)" if item.baseline is None else f"{item.baseline:.2f}%"
+        print(
+            f"  {item.path:<{width}}  "
+            f"{floor:>9}  "
+            f"{item.current:>8.2f}%  "
+            f"{item.gain:>+8.2f}"
+        )
+    print(f"\n  Total: {recorded_total:.2f}% -> {current_total:.2f}%")
+    print(
+        "\n  An unrecorded gain is protected by nothing: give it back later\n"
+        "  and no gate will notice.\n"
+    )
+    print(_how_to_record("Record"))
+
+
+def _check_staleness(config: Config, report: Report, baseline: Baseline) -> int:
+    """Fail when the committed baseline understates the project.
+
+    Only reached in check mode. The updating path answers the same question by
+    writing the gain down, so it has nothing to complain about.
+
+    Args:
+        config: The resolved project configuration.
+        report: The current coverage report.
+        baseline: The committed baseline.
+
+    Returns:
+        0 if the baseline is current, 1 otherwise.
+    """
+    if not config.baseline.exists():
+        print("No baseline recorded yet - nothing is gating this project.\n")
+        print(_how_to_record("Create"))
+        return 1
+
+    unrecorded = ratchet.find_unrecorded(report, baseline)
+    if unrecorded:
+        _print_unrecorded(
+            unrecorded,
+            recorded_total=baseline["total"],
+            current_total=report.total,
+        )
+        return 1
+
+    if ratchet.total_unrecorded(report, baseline):
+        print(
+            f"{BASELINE_NAME} is out of date: total coverage is "
+            f"{report.total:.2f}%, but only {baseline['total']:.2f}% is "
+            f"recorded.\n"
+        )
+        print(_how_to_record("Record"))
+        return 1
+
+    return 0
+
+
 def check_ratchet(config: Config, *, update: bool) -> int:
     """Apply the per-file coverage gate.
 
@@ -166,7 +262,7 @@ def check_ratchet(config: Config, *, update: bool) -> int:
     Returns:
         0 if coverage held or improved, 1 otherwise.
     """
-    report: Report = ratchet.read_report(config.coverage_json)
+    report: Report = ratchet.read_report(config.coverage_json, config.exclude)
     baseline: Baseline = ratchet.read_baseline(config.baseline)
 
     regressions = ratchet.find_regressions(report, baseline)
@@ -192,6 +288,8 @@ def check_ratchet(config: Config, *, update: bool) -> int:
             )
         else:
             print(f"Coverage baseline held at {updated['total']:.2f}%")
+    elif (code := _check_staleness(config, report, baseline)) != 0:
+        return code
     else:
         print(
             f"Coverage OK: {report.total:.2f}% total, "

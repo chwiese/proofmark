@@ -15,6 +15,7 @@ well-covered file keeps the total flat - hence per-file tracking.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict
@@ -60,11 +61,69 @@ class Regression:
         return self.baseline - self.current
 
 
-def read_report(path: Path) -> Report:
+@dataclass(frozen=True)
+class Unrecorded:
+    """One file the baseline understates - a gain nothing is protecting yet."""
+
+    path: str
+    # None when the file is absent from the baseline altogether. Such a file
+    # has no floor, so the per-file gate can never fail on it.
+    baseline: float | None
+    current: float
+
+    @property
+    def gain(self) -> float:
+        """Percentage points above what the baseline records."""
+        return self.current - (self.baseline or 0.0)
+
+
+def _is_excluded(path: str, prefixes: Sequence[str]) -> bool:
+    """Test a report path against directory prefixes, whole segments only.
+
+    Matching on a bare string prefix would make `tests` swallow
+    `tests_helper.py`, which is ordinary source.
+    """
+    # coverage.py writes paths with the platform separator.
+    normalised = path.replace("\\", "/")
+    return any(
+        normalised == prefix or normalised.startswith(f"{prefix}/")
+        for prefix in prefixes
+    )
+
+
+def _summarise(summaries: Iterable[Mapping[str, float]]) -> tuple[float, int]:
+    """Recompute a total and measured size from per-file summaries.
+
+    coverage.py's percentage is covered over measured, counting statements and
+    branches together, so summing the per-file numerators and denominators
+    reproduces exactly what it would have reported for this subset.
+
+    Args:
+        summaries: The `summary` block of each file being counted.
+
+    Returns:
+        The percentage covered and the measured size.
+    """
+    covered = 0
+    measured = 0
+    for summary in summaries:
+        # The branch keys are absent unless branch coverage is in effect.
+        covered += int(summary["covered_lines"]) + int(
+            summary.get("covered_branches", 0)
+        )
+        measured += int(summary["num_statements"]) + int(summary.get("num_branches", 0))
+    if measured == 0:
+        # coverage.py's reading of a project with nothing to cover.
+        return 100.0, 0
+    return 100.0 * covered / measured, measured
+
+
+def read_report(path: Path, exclude: Sequence[str] = ()) -> Report:
     """Parse a coverage.py JSON report.
 
     Args:
         path: Path to coverage.json.
+        exclude: Directory prefixes to leave out of the ratchet entirely.
 
     Returns:
         The parsed report.
@@ -77,19 +136,33 @@ def read_report(path: Path) -> Report:
             f"{path.name} not found - run the test suite with coverage first"
         )
 
+    prefixes = [prefix.replace("\\", "/").rstrip("/") for prefix in exclude]
+
     try:
         raw = json.loads(path.read_text())
-        totals = raw["totals"]
-        files = {
-            name: float(data["summary"]["percent_covered"])
+        summaries = {
+            name: data["summary"]
             for name, data in raw["files"].items()
+            if not _is_excluded(name, prefixes)
         }
-        # coverage.py omits the branch keys entirely when branch coverage is
-        # not in effect, so a project measuring statements only is still valid.
-        measured = int(totals["num_statements"]) + int(totals.get("num_branches", 0))
-        return Report(
-            total=float(totals["percent_covered"]), measured=measured, files=files
-        )
+        files = {
+            name: float(summary["percent_covered"])
+            for name, summary in summaries.items()
+        }
+        if len(summaries) == len(raw["files"]):
+            totals = raw["totals"]
+            total = float(totals["percent_covered"])
+            # coverage.py omits the branch keys entirely when branch coverage
+            # is not in effect, so a project measuring statements only is
+            # still valid.
+            measured = int(totals["num_statements"]) + int(
+                totals.get("num_branches", 0)
+            )
+        else:
+            # The totals block still counts the excluded files, so reusing it
+            # would fold the test suite's own coverage into the project's.
+            total, measured = _summarise(summaries.values())
+        return Report(total=total, measured=measured, files=files)
     except (KeyError, TypeError, ValueError) as exc:
         raise RatchetError(f"could not parse {path.name}: {exc}") from exc
 
@@ -177,6 +250,53 @@ def total_regressed(report: Report, baseline: Baseline) -> bool:
     if report.measured < baseline["measured"]:
         return False
     return report.total < baseline["total"] - EPSILON
+
+
+def find_unrecorded(report: Report, baseline: Baseline) -> list[Unrecorded]:
+    """Identify coverage the project has earned but never committed.
+
+    The mirror image of find_regressions, and the check that makes the ratchet
+    hold in a hook: a gain that is not written down is protected by nothing,
+    and giving it back later trips no gate.
+
+    Baseline entries missing from the report are deletions rather than gains,
+    and are deliberately not reported - failing a push for removing a file
+    would protect nothing.
+
+    Args:
+        report: The current coverage report.
+        baseline: The committed baseline.
+
+    Returns:
+        Unrecorded gains, biggest first.
+    """
+    gains = []
+    for name, current in report.files.items():
+        floor = baseline["files"].get(name)
+        if floor is None:
+            gains.append(Unrecorded(path=name, baseline=None, current=current))
+        elif current > floor + EPSILON:
+            gains.append(Unrecorded(path=name, baseline=floor, current=current))
+    return sorted(gains, key=lambda item: item.gain, reverse=True)
+
+
+def total_unrecorded(report: Report, baseline: Baseline) -> bool:
+    """Decide whether the overall percentage has risen above what is recorded.
+
+    Mirrors total_regressed, including its size guard: once the codebase has
+    shrunk the two totals describe different things, and deleting poorly
+    covered code raises the average without anything having been earned.
+
+    Args:
+        report: The current coverage report.
+        baseline: The committed baseline.
+
+    Returns:
+        True if the total gained in a way worth recording.
+    """
+    if report.measured < baseline["measured"]:
+        return False
+    return report.total > baseline["total"] + EPSILON
 
 
 def raise_baseline(report: Report, baseline: Baseline) -> Baseline:

@@ -103,6 +103,126 @@ def test_explicit_source_wins_over_inference(tmp_path: Path) -> None:
     assert load(tmp_path).source == "custom_dir"
 
 
+# Exclusions
+#
+# Only a flat layout needs them: measuring "." sweeps the test suite in
+# alongside the code, and a coverage floor on a test file records nothing
+# anyone would act on.
+
+
+def test_flat_layout_excludes_the_declared_testpaths(tmp_path: Path) -> None:
+    write_pyproject(
+        tmp_path,
+        """
+        [project]
+        name = "flatproj"
+
+        [tool.pytest.ini_options]
+        testpaths = ["suite"]
+        """,
+    )
+    (tmp_path / "flatproj.py").write_text("")
+
+    assert load(tmp_path).exclude == ("suite",)
+
+
+def test_flat_layout_falls_back_to_conventional_test_directories(
+    tmp_path: Path,
+) -> None:
+    write_pyproject(tmp_path, '[project]\nname = "flatproj"\n')
+    (tmp_path / "flatproj.py").write_text("")
+    (tmp_path / "tests").mkdir()
+
+    assert load(tmp_path).exclude == ("tests",)
+
+
+def test_conventional_fallback_only_names_directories_that_exist(
+    tmp_path: Path,
+) -> None:
+    write_pyproject(tmp_path, '[project]\nname = "flatproj"\n')
+    (tmp_path / "flatproj.py").write_text("")
+
+    assert load(tmp_path).exclude == ()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '[project]\nname = "flatproj"\n[tool.pytest]\n',
+        '[project]\nname = "flatproj"\n[tool.pytest.ini_options]\naddopts = "-q"\n',
+        '[project]\nname = "flatproj"\n[tool.pytest.ini_options]\ntestpaths = 3\n',
+    ],
+)
+def test_a_pytest_section_without_usable_testpaths_falls_back(
+    tmp_path: Path, body: str
+) -> None:
+    """Every section is optional, and a hand-edited one can be the wrong shape.
+
+    Neither is worth an error when the answer is just that the setting was not
+    given, so the conventional directories still apply.
+    """
+    write_pyproject(tmp_path, body)
+    (tmp_path / "flatproj.py").write_text("")
+    (tmp_path / "tests").mkdir()
+
+    assert load(tmp_path).exclude == ("tests",)
+
+
+def test_a_package_layout_excludes_nothing(tmp_path: Path) -> None:
+    """Coverage scoped to a package never reached the tests to begin with."""
+    write_pyproject(
+        tmp_path,
+        """
+        [project]
+        name = "myapp"
+
+        [tool.pytest.ini_options]
+        testpaths = ["tests"]
+        """,
+    )
+    (tmp_path / "myapp").mkdir()
+    (tmp_path / "tests").mkdir()
+
+    assert load(tmp_path).exclude == ()
+
+
+def test_explicit_exclude_wins_over_inference(tmp_path: Path) -> None:
+    """Replaces rather than extends, matching how `source` already behaves."""
+    write_pyproject(
+        tmp_path,
+        """
+        [project]
+        name = "flatproj"
+
+        [tool.proofmark]
+        exclude = ["mutants"]
+
+        [tool.pytest.ini_options]
+        testpaths = ["tests"]
+        """,
+    )
+    (tmp_path / "flatproj.py").write_text("")
+
+    assert load(tmp_path).exclude == ("mutants",)
+
+
+def test_explicit_exclude_applies_to_a_package_layout_too(tmp_path: Path) -> None:
+    """The escape hatch has to work wherever a stray directory gets measured."""
+    write_pyproject(
+        tmp_path,
+        """
+        [project]
+        name = "myapp"
+
+        [tool.proofmark]
+        exclude = ["mutants"]
+        """,
+    )
+    (tmp_path / "myapp").mkdir()
+
+    assert load(tmp_path).exclude == ("mutants",)
+
+
 # Defaults and overrides
 
 
@@ -155,6 +275,8 @@ def test_derived_paths_sit_at_the_project_root(tmp_path: Path) -> None:
         ("[tool.proofmark]\ndiff_threshold = 101\n", "between 0 and 100"),
         ("[tool.proofmark]\ndiff_threshold = -1\n", "between 0 and 100"),
         ("[tool.proofmark]\ncompare_branch = 5\n", "compare_branch must be a string"),
+        ("[tool.proofmark]\nexclude = 'tests'\n", "exclude must be a list of strings"),
+        ("[tool.proofmark]\nexclude = [3]\n", "exclude must be a list of strings"),
     ],
 )
 def test_invalid_config_is_rejected(tmp_path: Path, body: str, message: str) -> None:

@@ -16,10 +16,12 @@ from proofmark.ratchet import (
     RatchetError,
     Report,
     find_regressions,
+    find_unrecorded,
     raise_baseline,
     read_baseline,
     read_report,
     total_regressed,
+    total_unrecorded,
     write_baseline,
 )
 
@@ -61,6 +63,46 @@ def write_coverage_json(
                 "files": {
                     name: {"summary": {"percent_covered": pct}}
                     for name, pct in files.items()
+                },
+            }
+        )
+    )
+
+
+def write_counted_coverage_json(path: Path, files: dict[str, tuple[int, int]]) -> None:
+    """Write a report whose per-file summaries carry real counts.
+
+    `files` maps a path to (covered, measured), each already combining
+    statements and branches - the denominator coverage.py reports percentages
+    against. The totals block is filled in consistently across every file, so
+    a test that excludes one can tell a recomputed total from a reused one.
+    """
+    summaries = {
+        name: {
+            "covered_lines": covered,
+            "num_statements": measured,
+            "covered_branches": 0,
+            "num_branches": 0,
+            "percent_covered": 100.0 * covered / measured if measured else 100.0,
+        }
+        for name, (covered, measured) in files.items()
+    }
+    covered_total = sum(covered for covered, _ in files.values())
+    measured_total = sum(measured for _, measured in files.values())
+    path.write_text(
+        json.dumps(
+            {
+                "totals": {
+                    "percent_covered": (
+                        100.0 * covered_total / measured_total
+                        if measured_total
+                        else 100.0
+                    ),
+                    "num_statements": measured_total,
+                    "num_branches": 0,
+                },
+                "files": {
+                    name: {"summary": summary} for name, summary in summaries.items()
                 },
             }
         )
@@ -115,6 +157,77 @@ def test_read_report_rejects_malformed_file(tmp_path: Path) -> None:
 
     with pytest.raises(RatchetError, match="could not parse"):
         read_report(path)
+
+
+# Excluding paths from the report
+#
+# A flat-module project is measured as `.`, which sweeps the test suite in
+# alongside the code. Those files belong to neither gate: pinning a test file
+# at a coverage floor records nothing anyone would act on.
+
+
+def test_excluded_files_are_dropped(tmp_path: Path) -> None:
+    path = tmp_path / "coverage.json"
+    write_counted_coverage_json(
+        path, {"app.py": (50, 100), "tests/test_app.py": (100, 100)}
+    )
+
+    report = read_report(path, exclude=["tests"])
+
+    assert set(report.files) == {"app.py"}
+
+
+def test_excluding_recomputes_the_total_and_measured_size(tmp_path: Path) -> None:
+    """The totals block still counts the excluded files, so it cannot be reused.
+
+    Left alone it would report the test suite's own coverage as part of the
+    project's, which is the number the baseline then locks in.
+    """
+    path = tmp_path / "coverage.json"
+    write_counted_coverage_json(
+        path, {"app.py": (50, 100), "tests/test_app.py": (100, 100)}
+    )
+
+    report = read_report(path, exclude=["tests"])
+
+    assert report.total == pytest.approx(50.0)  # not 75.0, the two-file average
+    assert report.measured == 100
+
+
+def test_totals_are_used_verbatim_when_nothing_is_excluded(tmp_path: Path) -> None:
+    path = tmp_path / "coverage.json"
+    write_counted_coverage_json(
+        path, {"app.py": (50, 100), "tests/test_app.py": (100, 100)}
+    )
+
+    report = read_report(path, exclude=["nowhere"])
+
+    assert report.total == pytest.approx(75.0)
+    assert report.measured == 200
+
+
+def test_a_prefix_matches_only_whole_path_segments(tmp_path: Path) -> None:
+    """`tests` must not swallow `tests_helper.py`, which is ordinary source."""
+    path = tmp_path / "coverage.json"
+    write_counted_coverage_json(
+        path, {"tests_helper.py": (1, 2), "tests/test_app.py": (1, 1)}
+    )
+
+    report = read_report(path, exclude=["tests"])
+
+    assert set(report.files) == {"tests_helper.py"}
+
+
+def test_excluding_the_whole_report_measures_nothing(tmp_path: Path) -> None:
+    """Nothing measured is not a regression - the total gate goes vacuous."""
+    path = tmp_path / "coverage.json"
+    write_counted_coverage_json(path, {"tests/test_app.py": (1, 1)})
+
+    report = read_report(path, exclude=["tests"])
+
+    assert report.files == {}
+    assert report.measured == 0
+    assert report.total == 100.0  # coverage.py's own reading of "nothing to cover"
 
 
 # Per-file gate
@@ -262,6 +375,120 @@ def test_shrinking_is_not_a_loophole_for_per_file_drops() -> None:
 
     assert not total_regressed(report, baseline)
     assert find_regressions(report, baseline)  # per-file gate still fires
+
+
+# Unrecorded gains
+#
+# The mirror image of a regression: coverage the project has earned but never
+# committed. Left undetected it is the broken ratchet - the gain is not
+# protected by anything, and giving it back later trips no gate.
+
+
+def test_a_raised_file_is_unrecorded() -> None:
+    (gain,) = find_unrecorded(
+        make_report({"a.py": 90.0}), make_baseline({"a.py": 80.0})
+    )
+
+    assert gain.path == "a.py"
+    assert gain.baseline == 80.0
+    assert gain.current == 90.0
+    assert gain.gain == pytest.approx(10.0)
+
+
+def test_an_untracked_file_is_unrecorded() -> None:
+    """A file absent from the baseline has no floor, so it can never regress."""
+    (gain,) = find_unrecorded(make_report({"new.py": 40.0}), make_baseline())
+
+    assert gain.path == "new.py"
+    assert gain.baseline is None
+    assert gain.gain == pytest.approx(40.0)
+
+
+def test_unrecorded_gains_are_reported_biggest_first() -> None:
+    report = make_report({"small.py": 82.0, "big.py": 95.0})
+    baseline = make_baseline({"small.py": 80.0, "big.py": 30.0})
+
+    paths = [item.path for item in find_unrecorded(report, baseline)]
+
+    assert paths == ["big.py", "small.py"]
+
+
+def test_a_held_file_is_not_unrecorded() -> None:
+    assert (
+        find_unrecorded(make_report({"a.py": 80.0}), make_baseline({"a.py": 80.0}))
+        == []
+    )
+
+
+def test_a_regressed_file_is_not_unrecorded() -> None:
+    assert (
+        find_unrecorded(make_report({"a.py": 60.0}), make_baseline({"a.py": 80.0}))
+        == []
+    )
+
+
+def test_float_noise_is_not_an_unrecorded_gain() -> None:
+    """Same tolerance as the regression gate, so a wobble cannot fail a push."""
+    ceiling = 80.0
+    report = make_report({"a.py": ceiling + EPSILON})
+    baseline = make_baseline({"a.py": ceiling})
+
+    assert find_unrecorded(report, baseline) == []
+
+
+def test_just_beyond_the_tolerance_is_an_unrecorded_gain() -> None:
+    ceiling = 80.0
+    report = make_report({"a.py": ceiling + EPSILON * 2})
+    baseline = make_baseline({"a.py": ceiling})
+
+    assert len(find_unrecorded(report, baseline)) == 1
+
+
+def test_a_deleted_file_is_not_an_unrecorded_gain() -> None:
+    """Removing code leaves a stale entry, but nothing was earned by it.
+
+    Failing here would block a push for a pure deletion, which no gate is
+    protecting anything by doing.
+    """
+    report = make_report({"a.py": 80.0})
+    baseline = make_baseline({"a.py": 80.0, "gone.py": 100.0})
+
+    assert find_unrecorded(report, baseline) == []
+
+
+def test_total_gain_is_unrecorded_at_equal_size() -> None:
+    report = make_report(total=70.0, measured=1000)
+    baseline = make_baseline(total=60.0, measured=1000)
+
+    assert total_unrecorded(report, baseline)
+
+
+def test_total_gain_ignored_when_codebase_shrank() -> None:
+    """Deleting poorly covered code raises the average without earning anything.
+
+    The mirror of the same allowance in total_regressed: once the codebase has
+    shrunk, the two totals describe different things and comparing them says
+    nothing.
+    """
+    report = make_report(total=70.0, measured=800)
+    baseline = make_baseline(total=60.0, measured=1000)
+
+    assert not total_unrecorded(report, baseline)
+
+
+def test_a_held_total_is_not_unrecorded() -> None:
+    report = make_report(total=60.0, measured=1000)
+    baseline = make_baseline(total=60.0, measured=1000)
+
+    assert not total_unrecorded(report, baseline)
+
+
+def test_total_exactly_one_epsilon_above_is_not_unrecorded() -> None:
+    ceiling = 60.0
+    report = make_report(total=ceiling + EPSILON, measured=1000)
+    baseline = make_baseline(total=ceiling, measured=1000)
+
+    assert not total_unrecorded(report, baseline)
 
 
 # Raising the baseline

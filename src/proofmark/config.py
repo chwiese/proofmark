@@ -17,6 +17,10 @@ BASELINE_NAME = ".coverage-baseline.json"
 DEFAULT_DIFF_THRESHOLD = 80
 DEFAULT_COMPARE_BRANCH = "origin/main"
 
+# Where a flat-layout project's tests conventionally live, used only when it
+# declares no pytest testpaths of its own.
+CONVENTIONAL_TEST_DIRS = ("tests", "test")
+
 
 class ConfigError(Exception):
     """Raised when the project or its configuration cannot be resolved."""
@@ -30,6 +34,8 @@ class Config:
     source: str
     diff_threshold: int
     compare_branch: str
+    # Directory prefixes the ratchet ignores, normally the test suite.
+    exclude: tuple[str, ...] = ()
 
     @property
     def baseline(self) -> Path:
@@ -70,6 +76,28 @@ def find_project_root(start: Path | None = None) -> Path:
     raise ConfigError(f"no pyproject.toml found at or above {current}")
 
 
+def _table(mapping: dict[str, object], *keys: str) -> dict[str, object]:
+    """Walk a chain of TOML tables, treating anything missing as empty.
+
+    Every section proofmark reads is optional, and a hand-edited pyproject.toml
+    can put a non-table where one is expected. Neither is worth an error when
+    the answer is simply that the setting was not given.
+
+    Args:
+        mapping: Parsed TOML to walk from.
+        keys: Table names to descend through, outermost first.
+
+    Returns:
+        The innermost table, or an empty one if any step is missing.
+    """
+    for key in keys:
+        value = mapping.get(key)
+        if not isinstance(value, dict):
+            return {}
+        mapping = value
+    return mapping
+
+
 def _infer_source(root: Path, pyproject: dict[str, object]) -> str:
     """Guess the coverage target from the project layout.
 
@@ -85,15 +113,35 @@ def _infer_source(root: Path, pyproject: dict[str, object]) -> str:
     Returns:
         A value suitable for passing to `pytest --cov=`.
     """
-    project = pyproject.get("project")
-    if isinstance(project, dict):
-        name = project.get("name")
-        if isinstance(name, str):
-            module = name.replace("-", "_")
-            for candidate in (root / module, root / "src" / module):
-                if candidate.is_dir():
-                    return str(candidate.relative_to(root))
+    name = _table(pyproject, "project").get("name")
+    if isinstance(name, str):
+        module = name.replace("-", "_")
+        for candidate in (root / module, root / "src" / module):
+            if candidate.is_dir():
+                return str(candidate.relative_to(root))
     return "."
+
+
+def _infer_exclusions(root: Path, pyproject: dict[str, object]) -> tuple[str, ...]:
+    """Guess which directories the ratchet should ignore.
+
+    Only relevant to a flat layout. There the coverage target is ".", which
+    measures the test suite alongside the code, and a committed floor on a test
+    file records nothing anyone would act on. A project whose coverage is
+    scoped to a package never reached its tests to begin with.
+
+    Args:
+        root: The project root.
+        pyproject: Parsed pyproject.toml contents.
+
+    Returns:
+        Directory prefixes to leave out of the ratchet.
+    """
+    testpaths = _table(pyproject, "tool", "pytest", "ini_options").get("testpaths")
+    if isinstance(testpaths, list):
+        return tuple(item for item in testpaths if isinstance(item, str))
+
+    return tuple(name for name in CONVENTIONAL_TEST_DIRS if (root / name).is_dir())
 
 
 def load(start: Path | None = None) -> Config:
@@ -113,12 +161,7 @@ def load(start: Path | None = None) -> Config:
     with (root / "pyproject.toml").open("rb") as handle:
         pyproject = tomllib.load(handle)
 
-    tool = pyproject.get("tool")
-    section: dict[str, object] = {}
-    if isinstance(tool, dict):
-        candidate = tool.get(CONFIG_SECTION)
-        if isinstance(candidate, dict):
-            section = candidate
+    section = _table(pyproject, "tool", CONFIG_SECTION)
 
     source = section.get("source")
     if source is not None and not isinstance(source, str):
@@ -134,9 +177,26 @@ def load(start: Path | None = None) -> Config:
     if not isinstance(branch, str):
         raise ConfigError("tool.proofmark.compare_branch must be a string")
 
+    exclude = section.get("exclude")
+    if exclude is not None and (
+        not isinstance(exclude, list)
+        or not all(isinstance(item, str) for item in exclude)
+    ):
+        raise ConfigError("tool.proofmark.exclude must be a list of strings")
+
+    resolved_source = source if source is not None else _infer_source(root, pyproject)
+
+    if exclude is not None:
+        exclusions = tuple(item for item in exclude if isinstance(item, str))
+    elif resolved_source == ".":
+        exclusions = _infer_exclusions(root, pyproject)
+    else:
+        exclusions = ()
+
     return Config(
         root=root,
-        source=source if source is not None else _infer_source(root, pyproject),
+        source=resolved_source,
         diff_threshold=threshold,
         compare_branch=branch,
+        exclude=exclusions,
     )
