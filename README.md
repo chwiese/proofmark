@@ -203,7 +203,7 @@ Over HTTPS:
 ```yaml
 repos:
   - repo: https://github.com/chwiese/proofmark
-    rev: v0.3.0
+    rev: v0.4.0
     hooks:
       - id: proofmark-commit
         stages: [pre-commit]
@@ -216,7 +216,7 @@ Over SSH:
 ```yaml
 repos:
   - repo: git@github.com:chwiese/proofmark.git
-    rev: v0.3.0
+    rev: v0.4.0
     hooks:
       - id: proofmark-commit
         stages: [pre-commit]
