@@ -44,11 +44,16 @@ def stub_gates(monkeypatch: pytest.MonkeyPatch, config: Config) -> list[str]:
     def stub_mutants(_config: Config) -> None:
         order.append("mutants")
 
+    def stub_commit(_config: Config) -> int:
+        order.append("commit checks")
+        return 0
+
     monkeypatch.setattr(cli, "load", lambda: config)
     monkeypatch.setattr(runner, "run_pytest", stub_pytest)
     monkeypatch.setattr(runner, "check_ratchet", stub_ratchet)
     monkeypatch.setattr(runner, "check_diff_coverage", stub_diff)
     monkeypatch.setattr(runner, "run_mutation_testing", stub_mutants)
+    monkeypatch.setattr(runner, "run_commit_checks", stub_commit)
     return order
 
 
@@ -137,6 +142,77 @@ def test_check_subcommand_runs_the_gate_only(stub_gates: list[str]) -> None:
 def test_check_update_raises_the_baseline(stub_gates: list[str]) -> None:
     assert cli.main(["check", "--update"]) == 0
     assert stub_gates == ["ratchet(update=True)"]
+
+
+# The commit subcommand
+
+
+def test_commit_subcommand_runs_the_staged_checks_alone(stub_gates: list[str]) -> None:
+    """It is a commit-stage hook, so it must not drag the whole suite along."""
+    assert cli.main(["commit"]) == 0
+    assert stub_gates == ["commit checks"]
+
+
+def test_the_commit_checks_are_not_part_of_a_run(stub_gates: list[str]) -> None:
+    cli.main(["run"])
+    assert "commit checks" not in stub_gates
+
+
+def test_a_failing_commit_check_is_propagated(
+    monkeypatch: pytest.MonkeyPatch, stub_gates: list[str]
+) -> None:
+    """A failing test has to block the commit, not merely be reported."""
+    monkeypatch.setattr(runner, "run_commit_checks", lambda c: 1)
+
+    assert cli.main(["commit"]) == 1
+
+
+# Self-documentation
+#
+# What `--help` prints is the whole interface to a command line tool. The
+# wording of it is not behaviour and is deliberately not asserted - that every
+# command and flag says something is.
+
+
+def help_for(argv: list[str], capsys: pytest.CaptureFixture[str]) -> str:
+    """Ask the parser for its help, the way a user would."""
+    with pytest.raises(SystemExit):
+        cli.main([*argv, "--help"])
+    return capsys.readouterr().out
+
+
+def described(help_text: str, name: str) -> str:
+    """The text argparse lists beside a name, empty if it lists none."""
+    for line in help_text.splitlines():
+        words = line.split()
+        if words and words[0].rstrip(",") == name:
+            return " ".join(words[1:])
+    return ""
+
+
+@pytest.mark.parametrize("name", ["run", "check", "commit"])
+def test_every_subcommand_is_described(
+    name: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert described(help_for([], capsys), name)
+
+
+@pytest.mark.parametrize(
+    ("command", "flag"),
+    [("run", "--check"), ("run", "--mutants"), ("check", "--update")],
+)
+def test_every_flag_is_described(
+    command: str, flag: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert described(help_for([command], capsys), flag)
+
+
+def test_the_tool_names_and_describes_itself() -> None:
+    """Without a prog name argparse would call it whatever invoked it."""
+    parser = cli._build_parser()
+
+    assert parser.prog == "proofmark"
+    assert parser.description
 
 
 # Error handling

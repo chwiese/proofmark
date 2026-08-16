@@ -6,6 +6,7 @@ execution itself is stubbed - the point is the decisions, not uv's behaviour.
 """
 
 import json
+import os
 import subprocess
 from collections.abc import Sequence
 from pathlib import Path
@@ -96,6 +97,43 @@ class RecordingRun:
         if isinstance(cwd, Path):
             self.cwds.append(cwd)
         return subprocess.CompletedProcess(args=list(args), returncode=self.returncode)
+
+
+class Commands:
+    """Answers each subprocess call according to the tool it invokes.
+
+    The staged mutation pass shells out to several tools in one pass and reads
+    the output of some of them, so a single canned reply will not do.
+    """
+
+    def __init__(
+        self,
+        outputs: dict[str, str],
+        returncode: int = 0,
+        failing: Sequence[str] = (),
+    ) -> None:
+        self.outputs = outputs
+        self.returncode = returncode
+        self.failing = failing
+        self.calls: list[list[str]] = []
+        self.kwargs_by_call: dict[str, dict[str, object]] = {}
+
+    def __call__(
+        self, args: Sequence[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append(list(args))
+        self.kwargs_by_call[" ".join(args)] = kwargs
+        stdout = next((out for token, out in self.outputs.items() if token in args), "")
+        failed = any(token in args for token in self.failing)
+        return subprocess.CompletedProcess(
+            args=list(args),
+            returncode=1 if failed else self.returncode,
+            stdout=stdout,
+        )
+
+    def invoked(self, token: str) -> list[list[str]]:
+        """Every call that ran the named tool."""
+        return [call for call in self.calls if token in call]
 
 
 class FakeStdout:
@@ -585,7 +623,7 @@ def test_diff_coverage_propagates_failure(
 def test_mutation_testing_never_gates(
     monkeypatch: pytest.MonkeyPatch, config: Config
 ) -> None:
-    """Mutmut exits non-zero whenever mutants survive; that is information."""
+    """Survivors are information, so nothing about them fails the sweep."""
     monkeypatch.setattr(runner, "is_installed", lambda module, config: True)
     monkeypatch.setattr(subprocess, "run", RecordingRun(returncode=2))
 
@@ -602,6 +640,353 @@ def test_mutation_testing_invokes_mutmut(
     runner.run_mutation_testing(config)
 
     assert recorder.calls == [["uv", "run", "mutmut", "run"]]
+
+
+# Mutation testing on the staged diff
+
+
+STAGED_DIFF = """diff --git a/pkg/mod.py b/pkg/mod.py
+--- a/pkg/mod.py
++++ b/pkg/mod.py
+@@ -1,0 +2,1 @@
++    return value + 1
+"""
+
+
+@pytest.fixture
+def staged(config: Config) -> None:
+    """Put the file the canned diff refers to on disk."""
+    module = config.root / "pkg" / "mod.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("def thing(value):\n    return value + 1\n")
+
+
+def test_staged_mutation_asks_only_for_the_changed_function(
+    monkeypatch: pytest.MonkeyPatch, config: Config, staged: None
+) -> None:
+    monkeypatch.setattr(runner, "is_installed", lambda module, config: True)
+    commands = Commands({"diff": STAGED_DIFF})
+    monkeypatch.setattr(subprocess, "run", commands)
+
+    runner.run_commit_checks(config)
+
+    assert [
+        "uv",
+        "run",
+        "mutmut",
+        "run",
+        "pkg.mod.x_thing__mutmut_*",
+    ] in commands.calls
+
+
+STAGED_TEST_DIFF = """diff --git a/tests/test_mod.py b/tests/test_mod.py
+--- a/tests/test_mod.py
++++ b/tests/test_mod.py
+@@ -1,0 +2,1 @@
++    assert thing(1) == 2
+"""
+
+
+def test_a_staged_test_module_is_run(
+    monkeypatch: pytest.MonkeyPatch, config: Config
+) -> None:
+    """Mutmut never mutates a test, so nothing else would notice it broke."""
+    monkeypatch.setattr(runner, "is_installed", lambda module, config: True)
+    commands = Commands({"diff": STAGED_TEST_DIFF})
+    monkeypatch.setattr(subprocess, "run", commands)
+
+    runner.run_commit_checks(config)
+
+    assert ["uv", "run", "pytest", "tests/test_mod.py"] in commands.calls
+
+
+def test_a_failing_staged_test_blocks_the_commit(
+    monkeypatch: pytest.MonkeyPatch, config: Config, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(runner, "is_installed", lambda module, config: True)
+    commands = Commands(
+        {"diff": STAGED_TEST_DIFF, "pytest": "E   assert 1 == 2\n"},
+        failing=["pytest"],
+    )
+    monkeypatch.setattr(subprocess, "run", commands)
+
+    assert runner.run_commit_checks(config) == 1
+
+    out = capsys.readouterr().out
+    assert "assert 1 == 2" in out
+    assert commands.invoked("mutmut") == []
+
+
+def test_a_test_module_that_collects_nothing_is_not_a_failure(
+    monkeypatch: pytest.MonkeyPatch, config: Config
+) -> None:
+    """Pytest exits 5 for an empty module, which is not a broken test."""
+    monkeypatch.setattr(runner, "is_installed", lambda module, config: True)
+    commands = Commands({"diff": STAGED_TEST_DIFF}, returncode=5)
+    monkeypatch.setattr(subprocess, "run", commands)
+
+    assert runner.run_commit_checks(config) == 0
+
+
+def test_mutmut_failing_to_complete_blocks_the_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    config: Config,
+    staged: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """It runs the tests reaching the changed functions and stops if they fail.
+
+    Its status is only non-zero when it could not do its job - survivors alone
+    leave it zero - so this is the tests, reported rather than swallowed.
+    """
+    monkeypatch.setattr(runner, "is_installed", lambda module, config: True)
+    commands = Commands(
+        {"diff": STAGED_DIFF, "run": "Failed to run clean test\n"},
+        failing=["mutmut"],
+    )
+    monkeypatch.setattr(subprocess, "run", commands)
+
+    assert runner.run_commit_checks(config) == 1
+    assert "Failed to run clean test" in capsys.readouterr().out
+
+
+def test_a_clean_commit_reports_success(
+    monkeypatch: pytest.MonkeyPatch, config: Config, staged: None
+) -> None:
+    monkeypatch.setattr(runner, "is_installed", lambda module, config: True)
+    results = "    pkg.mod.x_thing__mutmut_1: killed\n"
+    monkeypatch.setattr(
+        subprocess, "run", Commands({"diff": STAGED_DIFF, "results": results})
+    )
+
+    assert runner.run_commit_checks(config) == 0
+
+
+def test_the_staged_diff_is_read_without_context_lines(
+    monkeypatch: pytest.MonkeyPatch, config: Config
+) -> None:
+    """Context lines would widen the selection to functions nobody touched."""
+    commands = Commands({})
+    monkeypatch.setattr(subprocess, "run", commands)
+
+    runner.run_commit_checks(config)
+
+    (diff_call,) = commands.invoked("diff")
+    assert "--cached" in diff_call
+    assert "--unified=0" in diff_call
+
+
+def test_unreadable_verdicts_leave_the_cache_unused(
+    monkeypatch: pytest.MonkeyPatch, config: Config, staged: None
+) -> None:
+    """Verdicts are an optimisation; failing to read them must not skip work."""
+    monkeypatch.setattr(runner, "is_installed", lambda module, config: True)
+    results = "    pkg.mod.x_thing__mutmut_1: killed\n"
+    commands = Commands({"diff": STAGED_DIFF, "results": results}, failing=["results"])
+    monkeypatch.setattr(subprocess, "run", commands)
+
+    runner.run_commit_checks(config)
+
+    assert ["uv", "run", "mutmut", "run", "pkg.mod.x_thing__mutmut_*"] in commands.calls
+
+
+def test_mutmuts_own_output_is_kept_out_of_the_way(
+    monkeypatch: pytest.MonkeyPatch,
+    config: Config,
+    staged: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The hook has to print unconditionally to be seen, so it prints little.
+
+    A passing hook's output is hidden unless it is marked verbose, and a
+    verbose hook shows everything - including mutmut's progress spinners on
+    every single commit.
+    """
+    monkeypatch.setattr(runner, "is_installed", lambda module, config: True)
+    results = "    pkg.mod.x_thing__mutmut_1: survived\n"
+    commands = Commands({"diff": STAGED_DIFF, "results": results})
+    monkeypatch.setattr(subprocess, "run", commands)
+
+    runner.run_commit_checks(config)
+
+    mutation_run = "uv run mutmut run pkg.mod.x_thing__mutmut_*"
+    assert commands.kwargs_by_call[mutation_run]["capture_output"] is True
+
+
+def test_a_mutmut_failure_is_not_swallowed(
+    monkeypatch: pytest.MonkeyPatch,
+    config: Config,
+    staged: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Quietening mutmut must not hide it falling over."""
+    monkeypatch.setattr(runner, "is_installed", lambda module, config: True)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        Commands({"diff": STAGED_DIFF, "run": "AssertionError: boom\n"}),
+    )
+
+    runner.run_commit_checks(config)
+
+    assert "AssertionError: boom" in capsys.readouterr().out
+
+
+def test_stale_test_associations_are_discarded_before_running(
+    monkeypatch: pytest.MonkeyPatch, config: Config, staged: None
+) -> None:
+    """Editing a function strips mutmut's record of which tests reach it.
+
+    Its stats cache is rebuilt only for tests that are new, so an existing test
+    covering a function you just changed is never re-associated with it, and
+    every mutant of that function then survives for want of anyone to kill it.
+    Those survivors are not real, and a report full of them is worse than no
+    report at all.
+    """
+    monkeypatch.setattr(runner, "is_installed", lambda module, config: True)
+    stats = config.root / "mutants" / "mutmut-stats.json"
+    stats.parent.mkdir(parents=True)
+    stats.write_text("{}")
+    monkeypatch.setattr(subprocess, "run", Commands({"diff": STAGED_DIFF}))
+
+    runner.run_commit_checks(config)
+
+    assert not stats.exists()
+
+
+def test_associations_are_kept_when_nothing_needs_running(
+    monkeypatch: pytest.MonkeyPatch, config: Config, staged: None
+) -> None:
+    """Only pay for the rebuild when a mutant is going to be tested.
+
+    It costs a whole instrumented run of the suite.
+    """
+    monkeypatch.setattr(runner, "is_installed", lambda module, config: True)
+    copy = config.root / "mutants" / "pkg" / "mod.py"
+    copy.parent.mkdir(parents=True)
+    copy.write_text("generated\n")
+    os.utime(config.root / "pkg" / "mod.py", (0, 100))
+    os.utime(copy, (0, 200))
+    stats = config.root / "mutants" / "mutmut-stats.json"
+    stats.write_text("{}")
+    results = "    pkg.mod.x_thing__mutmut_1: killed\n"
+    monkeypatch.setattr(
+        subprocess, "run", Commands({"diff": STAGED_DIFF, "results": results})
+    )
+
+    runner.run_commit_checks(config)
+
+    assert stats.exists()
+
+
+def test_a_change_with_nothing_to_mutate_stops_before_running(
+    monkeypatch: pytest.MonkeyPatch,
+    config: Config,
+    staged: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Mutmut errors on a pattern matching nothing, so it must not be asked."""
+    monkeypatch.setattr(runner, "is_installed", lambda module, config: True)
+    copy = config.root / "mutants" / "pkg" / "mod.py"
+    copy.parent.mkdir(parents=True)
+    copy.write_text("generated\n")
+    os.utime(config.root / "pkg" / "mod.py", (0, 100))
+    os.utime(copy, (0, 200))
+    elsewhere = "    other.x_thing__mutmut_1: killed\n"
+    commands = Commands({"diff": STAGED_DIFF, "results": elsewhere})
+    monkeypatch.setattr(subprocess, "run", commands)
+
+    runner.run_commit_checks(config)
+
+    assert [call for call in commands.calls if call[-1].endswith("__mutmut_*")] == []
+    assert "nothing mutable" in capsys.readouterr().out
+
+
+def test_nothing_staged_leaves_mutmut_alone(
+    monkeypatch: pytest.MonkeyPatch, config: Config, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A commit that touches no function should cost nothing at all."""
+    monkeypatch.setattr(runner, "is_installed", lambda module, config: True)
+    commands = Commands({})
+    monkeypatch.setattr(subprocess, "run", commands)
+
+    runner.run_commit_checks(config)
+
+    assert commands.invoked("mutmut") == []
+    assert "no functions" in capsys.readouterr().out
+
+
+def test_staged_mutation_never_gates(
+    monkeypatch: pytest.MonkeyPatch, config: Config, staged: None
+) -> None:
+    monkeypatch.setattr(runner, "is_installed", lambda module, config: True)
+    monkeypatch.setattr(
+        subprocess, "run", Commands({"diff": STAGED_DIFF}, returncode=2)
+    )
+
+    runner.run_commit_checks(config)  # must not raise
+
+
+def test_survivors_in_the_staged_function_are_reported(
+    monkeypatch: pytest.MonkeyPatch,
+    config: Config,
+    staged: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(runner, "is_installed", lambda module, config: True)
+    results = (
+        "    pkg.mod.x_thing__mutmut_1: killed\n"
+        "    pkg.mod.x_thing__mutmut_2: survived\n"
+    )
+    monkeypatch.setattr(
+        subprocess, "run", Commands({"diff": STAGED_DIFF, "results": results})
+    )
+
+    runner.run_commit_checks(config)
+
+    out = capsys.readouterr().out
+    assert "pkg/mod.py" in out
+    assert "thing" in out
+    assert "Advisory" in out
+
+
+def test_a_settled_function_is_reported_without_being_rerun(
+    monkeypatch: pytest.MonkeyPatch,
+    config: Config,
+    staged: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Mutmut re-tests anything named explicitly, so the skipping is ours."""
+    monkeypatch.setattr(runner, "is_installed", lambda module, config: True)
+    copy = config.root / "mutants" / "pkg" / "mod.py"
+    copy.parent.mkdir(parents=True)
+    copy.write_text("generated\n")
+    os.utime(config.root / "pkg" / "mod.py", (0, 100))
+    os.utime(copy, (0, 200))
+    results = "    pkg.mod.x_thing__mutmut_1: survived\n"
+    commands = Commands({"diff": STAGED_DIFF, "results": results})
+    monkeypatch.setattr(subprocess, "run", commands)
+
+    runner.run_commit_checks(config)
+
+    assert [call for call in commands.calls if call[-1].endswith("__mutmut_*")] == []
+    assert "thing" in capsys.readouterr().out
+
+
+def test_missing_mutmut_skips_the_staged_pass(
+    monkeypatch: pytest.MonkeyPatch,
+    config: Config,
+    staged: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(runner, "is_installed", lambda module, config: False)
+    commands = Commands({"diff": STAGED_DIFF})
+    monkeypatch.setattr(subprocess, "run", commands)
+
+    runner.run_commit_checks(config)
+
+    assert "mutmut is not installed" in capsys.readouterr().out
+    assert commands.invoked("mutmut") == []
 
 
 # Missing optional tooling

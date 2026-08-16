@@ -7,9 +7,18 @@ import subprocess
 import sys
 from collections.abc import Sequence
 
-from proofmark import ratchet
+from proofmark import mutants, ratchet
 from proofmark.config import BASELINE_NAME, Config
 from proofmark.ratchet import Baseline, Report
+
+# Where mutmut caches which tests reach which functions, under `mutants/`.
+MUTMUT_STATS_NAME = "mutmut-stats.json"
+
+# pytest's exit status when it collected nothing at all. For a ratchet, an
+# empty suite is a legitimate starting state rather than a failure: seeding a
+# baseline at zero is exactly how a project adopts the gate before it has
+# written its first test.
+PYTEST_NO_TESTS_COLLECTED = 5
 
 GREEN = "\033[0;32m"
 RED = "\033[0;31m"
@@ -77,14 +86,36 @@ def run_uv(args: Sequence[str], config: Config) -> int:
     return completed.returncode
 
 
+def run_uv_captured(args: Sequence[str], config: Config) -> tuple[int, str]:
+    """Run a command in the checked project and read back what it printed.
+
+    Args:
+        args: Arguments following `uv run`.
+        config: The resolved project configuration.
+
+    Returns:
+        The command's exit status and its standard output.
+    """
+    sys.stdout.flush()
+    completed = subprocess.run(
+        ["uv", "run", *args],
+        cwd=config.root,
+        env=_env_for_uv(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return completed.returncode, completed.stdout
+
+
 def is_installed(module: str, config: Config) -> bool:
     """Check whether a module is importable in the checked project.
 
     proofmark declares no dependencies of its own and resolves pytest,
     diff-cover and mutmut from the project instead. Probing first turns "you
     have not installed this" into a clear message rather than an opaque
-    failure from uv, or - for mutmut, whose exit status is deliberately
-    ignored - a silent no-op.
+    failure from uv, or - for the whole-tree mutmut sweep, which nothing fails
+    on - a silent no-op.
 
     Args:
         module: Importable module name.
@@ -341,17 +372,212 @@ def check_diff_coverage(config: Config) -> int:
     )
 
 
+def _staged_diff(config: Config) -> str:
+    """Read the diff of what is about to be committed.
+
+    Args:
+        config: The resolved project configuration.
+
+    Returns:
+        A unified diff with no context, empty if git had nothing to say.
+    """
+    completed = subprocess.run(
+        ["git", "diff", "--cached", "--unified=0", "--no-color", "--relative"],
+        cwd=config.root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return completed.stdout if completed.returncode == 0 else ""
+
+
+def _mutmut_verdicts(config: Config) -> dict[str, str]:
+    """Read the verdict mutmut currently records against each mutant.
+
+    A failure here is not worth reporting: the verdicts are an optimisation,
+    and without them every selected function is simply tested again.
+
+    Args:
+        config: The resolved project configuration.
+
+    Returns:
+        A verdict per mutant name, empty if none could be read.
+    """
+    code, output = run_uv_captured(["mutmut", "results", "--all", "True"], config)
+    return mutants.parse_verdicts(output) if code == 0 else {}
+
+
+def _discard_test_associations(config: Config) -> None:
+    """Make mutmut work out afresh which tests reach which functions.
+
+    It caches that map and rebuilds it only for tests it has not seen before.
+    Editing a function invalidates its entry without any test being new, so the
+    function is left with no tests to kill its mutants and every one of them
+    survives - reported against the code you just changed, which is the one
+    place a false survivor does the most damage.
+
+    Rebuilding costs one instrumented run of the suite, so callers only pay it
+    when a mutant is actually going to be tested.
+
+    Args:
+        config: The resolved project configuration.
+    """
+    (config.root / "mutants" / MUTMUT_STATS_NAME).unlink(missing_ok=True)
+
+
+def _print_survivors(rows: Sequence[mutants.Summary]) -> None:
+    """Report each function whose mutants got through, worst first.
+
+    Laid out like the regression table: which of several functions to write an
+    assertion for first is the question, so the counts have to be comparable at
+    a glance.
+    """
+    path_width = max(max(len(row.path) for row in rows), len("FILE"))
+    name_width = max(max(len(row.function) for row in rows), len("FUNCTION"))
+
+    print("Mutants survived in the code you are committing\n")
+    print(
+        f"  {'FILE':<{path_width}}  {'FUNCTION':<{name_width}}  "
+        f"{'SURVIVED':>8}  {'MUTANTS':>7}"
+    )
+    print(f"  {'─' * (path_width + name_width + 23)}")
+    for row in rows:
+        print(
+            f"  {row.path:<{path_width}}  "
+            f"{row.function:<{name_width}}  "
+            f"{row.survived:>8}  "
+            f"{row.total:>7}"
+        )
+    print(
+        "\n  Advisory only - a surviving mutant is evidence the tests do not\n"
+        "  distinguish a behaviour, not proof of a bug.\n"
+    )
+    print("  Review survivors with: uv run mutmut browse")
+
+
+def _run_staged_tests(config: Config, paths: Sequence[str]) -> int:
+    """Run the test modules this commit edits.
+
+    mutmut mutates the code under test, never the tests themselves, so a commit
+    that only touches a test file selects no mutants and the mutation pass
+    would report nothing at all. Running the modules you staged closes that.
+
+    Args:
+        config: The resolved project configuration.
+        paths: The staged test modules.
+
+    Returns:
+        0 if they passed, 1 otherwise.
+    """
+    status(
+        f"Running {len(paths)} staged test {'module' if len(paths) == 1 else 'modules'}..."
+    )
+    code, output = run_uv_captured(["pytest", *paths], config)
+    # An empty module is not a broken one, and is a normal state to commit
+    # while writing the first test in a file.
+    if code in (0, PYTEST_NO_TESTS_COLLECTED):
+        return 0
+    fail("Staged tests failed:")
+    print(output)
+    return 1
+
+
+def run_commit_checks(config: Config) -> int:
+    """Check the code this commit changes, before it becomes a commit.
+
+    Two things, in the order that makes the second meaningful. The tests
+    reaching the changed code have to pass, which gates: a failing test is not
+    a judgement call. Then the changed functions are mutation-tested, which
+    does not gate, for the reason set out in run_mutation_testing.
+
+    The tests are mostly not run here. mutmut rebuilds its map of which test
+    reaches which function, selects exactly those for the functions being
+    mutated, runs them, and stops if any fail - so the gate is to report that
+    rather than swallow it. What is run here is the test modules the commit
+    edits, which mutmut has no reason to look at.
+
+    Everything is narrowed to the staged diff, because the whole tree is too
+    much to ask of a commit and the code in front of you is the code you can
+    still do something about. Completeness belongs to the pre-push gates, which
+    run the suite entire.
+
+    Args:
+        config: The resolved project configuration.
+
+    Returns:
+        0 if the commit may proceed, 1 if a test failed.
+    """
+    changed = mutants.added_lines(_staged_diff(config))
+
+    staged_tests = mutants.test_files(changed)
+    if staged_tests and (code := _run_staged_tests(config, staged_tests)) != 0:
+        return code
+
+    targets = mutants.select(config.root, changed)
+    if not targets:
+        status("Mutation testing: no functions changed in this commit")
+        return 0
+
+    if not is_installed("mutmut", config):
+        warn(
+            "mutmut is not installed in this project - skipping mutation testing.\n"
+            "    Add it with: uv add --dev mutmut"
+        )
+        return 0
+
+    verdicts = _mutmut_verdicts(config)
+    to_run, settled = mutants.partition(config.root, targets, verdicts)
+    if not to_run and not settled:
+        status("Mutation testing: nothing mutable in the functions you changed")
+        return 0
+
+    if to_run:
+        status(
+            f"Testing {len(to_run)} changed "
+            f"{'function' if len(to_run) == 1 else 'functions'}..."
+        )
+        _discard_test_associations(config)
+        # Captured rather than inherited: this runs as a hook that has to print
+        # unconditionally to be seen at all, and mutmut's progress spinners on
+        # every commit would drown the one table worth reading.
+        code, noise = run_uv_captured(
+            ["mutmut", "run", *(target.glob for target in to_run)], config
+        )
+        if code != 0:
+            # Survivors alone leave mutmut's status at zero, so a non-zero one
+            # means it could not do its job. Overwhelmingly that is the tests
+            # it runs first against unmutated code having failed.
+            fail("Tests covering the changed code failed:")
+            print(mutants.without_progress(noise))
+            return 1
+        verdicts = _mutmut_verdicts(config)
+        if not verdicts:
+            # Claiming nothing survived would be a lie about a run we cannot
+            # read the results of.
+            warn("mutmut ran but reported no results:")
+            print(mutants.without_progress(noise))
+            return 0
+
+    rows = mutants.summarise([*to_run, *settled], verdicts)
+    if not rows:
+        status("No mutants survived in the code you are committing")
+        return 0
+    print()
+    _print_survivors(rows)
+    return 0
+
+
 def run_mutation_testing(config: Config) -> None:
-    """Run mutmut and point the user at the survivor list.
+    """Run mutmut over the whole tree and point the user at the survivor list.
 
-    Mutation testing is advisory. mutmut exits non-zero whenever mutants
-    survive, which is information rather than a failure: a surviving mutant is
-    evidence the tests do not distinguish a behaviour, not proof of a bug.
-    Gating on the score encourages writing assertions that kill mutants instead
-    of assertions that describe behaviour, so the exit status is ignored here.
+    Mutation testing is advisory: a surviving mutant is evidence the tests do
+    not distinguish a behaviour, not proof of a bug, and gating on the score
+    encourages writing assertions that kill mutants instead of assertions that
+    describe behaviour. Nothing here fails the run.
 
-    Because that status is ignored, a missing mutmut would otherwise look
-    exactly like a successful run - hence the explicit check first.
+    Nothing needs to be ignored to achieve that, because mutmut exits zero
+    however many mutants survive. A missing mutmut would still look exactly
+    like a successful sweep, though - hence the explicit check first.
 
     Args:
         config: The resolved project configuration.

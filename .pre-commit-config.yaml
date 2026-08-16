@@ -37,3 +37,12 @@ repos:
         pass_filenames: false
         always_run: true
         stages: [pre-push]
+
+      - id: proofmark-commit
+        name: proofmark (test and mutation-test staged code)
+        entry: uv run proofmark commit
+        language: system
+        pass_filenames: false
+        types: [python]
+        verbose: true
+        stages: [pre-commit]

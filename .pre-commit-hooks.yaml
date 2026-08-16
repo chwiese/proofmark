@@ -10,3 +10,23 @@
   pass_filenames: false
   always_run: true
   stages: [pre-push]
+
+- id: proofmark-commit
+  name: proofmark (test and mutation-test staged code)
+  description: >-
+    Run the tests reaching the code this commit changes, then mutation-test the
+    changed functions and report the mutants that survived. The tests gate; the
+    mutants are advice. Intended for the pre-commit stage, where a weak test is
+    reported against the commit you just made rather than a stack of them.
+  entry: proofmark commit
+  language: python
+  # The staged diff is read from git rather than taken from the hook, because
+  # which lines changed is the whole selection, not just which files.
+  pass_filenames: false
+  # Unlike the gates above this is not always_run: a commit touching no Python
+  # has no function to mutate, and skipping it outright costs nothing at all.
+  types: [python]
+  # The survivor table is the point of this hook and it is printed on success,
+  # which pre-commit and prek would otherwise hide.
+  verbose: true
+  stages: [pre-commit]

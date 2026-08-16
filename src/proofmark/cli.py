@@ -8,22 +8,17 @@ import sys
 from proofmark import runner
 from proofmark.config import Config, ConfigError, load
 from proofmark.ratchet import RatchetError
-
-# pytest's exit status when it collected nothing at all. For a ratchet, an
-# empty suite is a legitimate starting state rather than a failure: seeding a
-# baseline at zero is exactly how a project adopts the gate before it has
-# written its first test.
-PYTEST_NO_TESTS_COLLECTED = 5
+from proofmark.runner import PYTEST_NO_TESTS_COLLECTED
 
 
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the argument parser."""
     parser = argparse.ArgumentParser(
         prog="proofmark",
-        description=(
-            "Test quality gates: per-file coverage ratchet, diff coverage, "
-            "and mutation testing."
-        ),
+        # Kept on one line so do_not_mutate_patterns reaches it: the patterns
+        # are matched per line, and a string wrapped across several would start
+        # below the keyword naming it.
+        description="Test quality gates: per-file coverage ratchet, diff coverage, and mutation testing.",
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
 
@@ -50,6 +45,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--update",
         action="store_true",
         help="raise the baseline where coverage improved (never lowers it)",
+    )
+
+    subcommands.add_parser(
+        "commit",
+        help="test and mutation-test what this commit changes (use in hooks)",
     )
 
     return parser
@@ -113,6 +113,8 @@ def main(argv: list[str] | None = None) -> int:
         config = load()
         if args.command == "run":
             return _run(config, check_only=args.check, mutants=args.mutants)
+        if args.command == "commit":
+            return runner.run_commit_checks(config)
         return runner.check_ratchet(config, update=args.update)
     except (ConfigError, RatchetError) as exc:
         runner.fail(str(exc))

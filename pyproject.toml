@@ -44,10 +44,20 @@ source_paths = ["src/proofmark/"]
 pytest_add_cli_args_test_selection = ["tests/"]
 also_copy = ["tests/", "pyproject.toml"]
 mutate_only_covered_lines = true
-# Error message wording is not behaviour. Mutating these strings only produces
-# survivors that would be killed by asserting exact message text, which makes
-# the tests brittle for no gain - they already match on substrings.
-do_not_mutate_patterns = ["raise ConfigError\\("]
+# Wording is not behaviour. Mutating these strings only produces survivors that
+# would be killed by asserting exact text, which makes the tests brittle for no
+# gain - the tests already match on substrings.
+#
+# The argparse keywords cover the text `--help` prints. What the parser does -
+# subcommand and flag names, their actions, whether a subcommand is required -
+# is behaviour and stays mutated. So does whether help text exists at all,
+# which is why these patterns only suppress rewordings of it.
+do_not_mutate_patterns = [
+    "raise ConfigError\\(",
+    "\\bhelp=",
+    "\\bprog=",
+    "\\bdescription=",
+]
 
 [tool.mypy]
 python_version = "3.14"
