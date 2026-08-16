@@ -52,24 +52,12 @@ class Counts:
         return 100.0 * (self.measured - self.missing) / self.measured
 
 
-# One file's recorded standard. A bare float is an entry from a baseline
-# written before sizes were recorded: the percentage is known but the size is
-# not, so it falls back to comparing percentages until the next write upgrades
-# it in place.
-Floor = Counts | float
-
-
-def floor_percent(floor: Floor) -> float:
-    """Read the percentage out of a floor in either representation."""
-    return floor.percent if isinstance(floor, Counts) else floor
-
-
 class Baseline(TypedDict):
     """Committed coverage floors for one project."""
 
     total: float
     measured: int
-    files: dict[str, Floor]
+    files: dict[str, Counts]
 
 
 @dataclass(frozen=True)
@@ -210,25 +198,22 @@ def read_report(path: Path, exclude: Sequence[str] = ()) -> Report:
         raise RatchetError(f"could not parse {path.name}: {exc}") from exc
 
 
-def _read_floor(entry: object) -> Floor:
-    """Parse one recorded floor, accepting either representation.
-
-    A two-element list is the current form, `[missing, measured]`. A bare
-    number is an entry written before sizes were recorded; it is kept as a
-    percentage rather than guessed at, since no choice of size reproduces it
-    faithfully.
+def _read_floor(name: str, entry: object) -> Counts:
+    """Parse one recorded floor.
 
     Args:
-        entry: The value recorded against one file.
+        name: The file the entry belongs to, for the error message.
+        entry: The value recorded against it.
 
     Returns:
         The floor.
+
+    Raises:
+        ValueError: If the entry is not a `[missing, measured]` pair.
     """
     if isinstance(entry, list) and len(entry) == 2:
         return Counts(missing=int(entry[0]), measured=int(entry[1]))
-    if isinstance(entry, int | float):
-        return float(entry)
-    raise ValueError(f"unrecognised baseline entry: {entry!r}")
+    raise ValueError(f"expected [missing, measured] for {name!r}, found {entry!r}")
 
 
 def read_baseline(path: Path) -> Baseline:
@@ -239,25 +224,28 @@ def read_baseline(path: Path) -> Baseline:
 
     Returns:
         The baseline mapping.
+
+    Raises:
+        RatchetError: If the file exists but cannot be read.
     """
     if not path.exists():
         return {"total": 0.0, "measured": 0, "files": {}}
 
-    raw = json.loads(path.read_text())
-    return {
-        "total": float(raw.get("total", 0.0)),
-        "measured": int(raw.get("measured", 0)),
-        "files": {
-            name: _read_floor(entry) for name, entry in raw.get("files", {}).items()
-        },
-    }
-
-
-def _render_floor(floor: Floor) -> str:
-    """Serialise one floor onto a single line."""
-    if isinstance(floor, Counts):
-        return f"[{floor.missing}, {floor.measured}]"
-    return json.dumps(round(floor, 2))
+    try:
+        raw = json.loads(path.read_text())
+        return {
+            "total": float(raw.get("total", 0.0)),
+            "measured": int(raw.get("measured", 0)),
+            "files": {
+                name: _read_floor(name, entry)
+                for name, entry in raw.get("files", {}).items()
+            },
+        }
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise RatchetError(
+            f"could not parse {path.name}: {exc}\n"
+            f"    Delete it and run proofmark run to record it afresh."
+        ) from exc
 
 
 def write_baseline(path: Path, baseline: Baseline) -> None:
@@ -272,7 +260,8 @@ def write_baseline(path: Path, baseline: Baseline) -> None:
         baseline: The baseline to serialise.
     """
     entries = ",\n".join(
-        f"    {json.dumps(name)}: {_render_floor(baseline['files'][name])}"
+        f"    {json.dumps(name)}: "
+        f"[{baseline['files'][name].missing}, {baseline['files'][name].measured}]"
         for name in sorted(baseline["files"])
     )
     files = f"{{\n{entries}\n  }}" if entries else "{}"
@@ -300,7 +289,7 @@ def find_regressions(report: Report, baseline: Baseline) -> list[Regression]:
     """
     regressions = [
         Regression(
-            path=name, baseline=floor_percent(floor), current=report.files[name].percent
+            path=name, baseline=floor.percent, current=report.files[name].percent
         )
         for name, floor in baseline["files"].items()
         # A missing file was deleted or renamed; it drops out of the baseline.
@@ -309,7 +298,7 @@ def find_regressions(report: Report, baseline: Baseline) -> list[Regression]:
     return sorted(regressions, key=lambda item: item.drop, reverse=True)
 
 
-def _file_regressed(current: Counts, floor: Floor) -> bool:
+def _file_regressed(current: Counts, floor: Counts) -> bool:
     """Decide whether one file got worse, rather than merely smaller.
 
     A percentage is a ratio, so deleting covered lines lowers it without
@@ -329,9 +318,9 @@ def _file_regressed(current: Counts, floor: Floor) -> bool:
     Returns:
         True if the file regressed.
     """
-    if isinstance(floor, Counts) and current.measured < floor.measured:
+    if current.measured < floor.measured:
         return current.missing > floor.missing
-    return current.percent < floor_percent(floor) - EPSILON
+    return current.percent < floor.percent - EPSILON
 
 
 def total_regressed(report: Report, baseline: Baseline) -> bool:
@@ -384,15 +373,11 @@ def find_unrecorded(report: Report, baseline: Baseline) -> list[Unrecorded]:
         floor = baseline["files"].get(name)
         if floor is None:
             gains.append(Unrecorded(path=name, baseline=None, current=current.percent))
-        elif isinstance(floor, Counts) and current.measured < floor.measured:
+        elif current.measured < floor.measured:
             continue
-        elif current.percent > floor_percent(floor) + EPSILON:
+        elif current.percent > floor.percent + EPSILON:
             gains.append(
-                Unrecorded(
-                    path=name,
-                    baseline=floor_percent(floor),
-                    current=current.percent,
-                )
+                Unrecorded(path=name, baseline=floor.percent, current=current.percent)
             )
     return sorted(gains, key=lambda item: item.gain, reverse=True)
 
@@ -416,11 +401,11 @@ def total_unrecorded(report: Report, baseline: Baseline) -> bool:
     return report.total > baseline["total"] + EPSILON
 
 
-def _raise_floor(current: Counts, floor: Floor | None) -> Floor:
+def _raise_floor(current: Counts, floor: Counts | None) -> Counts:
     """Build one file's next floor, never lowering the standard it records.
 
     A shrunk file adopts the current counts outright, for the same reason the
-    total does: they are a matched snapshot, and holding a percentage measured
+    total does: they are a matched snapshot, and holding counts measured
     against a size the file no longer has would leave it looking shrunk on
     every later run and never recording anything again.
 
@@ -433,9 +418,9 @@ def _raise_floor(current: Counts, floor: Floor | None) -> Floor:
     """
     if floor is None:
         return current
-    if isinstance(floor, Counts) and current.measured < floor.measured:
+    if current.measured < floor.measured:
         return current
-    if current.percent >= floor_percent(floor):
+    if current.percent >= floor.percent:
         return current
     # Hold the higher standard: callers only reach here once the gate has
     # passed, so this is the sub-EPSILON sliver that would otherwise be

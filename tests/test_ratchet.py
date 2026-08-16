@@ -14,7 +14,6 @@ from proofmark.ratchet import (
     EPSILON,
     Baseline,
     Counts,
-    Floor,
     RatchetError,
     Report,
     find_regressions,
@@ -61,19 +60,7 @@ def make_baseline(
     total: float = 50.0,
     measured: int = 1000,
 ) -> Baseline:
-    floors: dict[str, Floor] = dict(_as_counts(files or {}))
-    return {"total": total, "measured": measured, "files": floors}
-
-
-def make_legacy_baseline(
-    files: dict[str, float],
-    *,
-    total: float = 50.0,
-    measured: int = 1000,
-) -> Baseline:
-    """A baseline in the pre-sizes format, where a floor is a bare percentage."""
-    floors: dict[str, Floor] = dict(files)
-    return {"total": total, "measured": measured, "files": floors}
+    return {"total": total, "measured": measured, "files": _as_counts(files or {})}
 
 
 def write_coverage_json(
@@ -779,13 +766,13 @@ def test_partial_baseline_falls_back_to_zeroes(tmp_path: Path) -> None:
     the real numbers.
     """
     path = tmp_path / ".coverage-baseline.json"
-    path.write_text(json.dumps({"files": {"a.py": 50.0}}))
+    path.write_text(json.dumps({"files": {"a.py": [5, 10]}}))
 
     baseline = read_baseline(path)
 
     assert baseline["total"] == 0.0
     assert baseline["measured"] == 0
-    assert baseline["files"] == {"a.py": 50.0}
+    assert baseline["files"] == {"a.py": Counts(missing=5, measured=10)}
 
 
 def test_baseline_without_a_files_key_reads_as_empty(tmp_path: Path) -> None:
@@ -848,75 +835,37 @@ def test_each_file_occupies_one_line(tmp_path: Path) -> None:
     assert sum("[" in line for line in path.read_text().splitlines()) == 3
 
 
-# Reading a baseline written before sizes were recorded
+# Rejecting a baseline that cannot be read
+#
+# A floor is a pair of counts and nothing else. Guessing at a size for an
+# entry that only records a percentage would invent a standard the project
+# never measured, so an unreadable file is reported rather than interpreted.
 
 
-def test_a_legacy_baseline_is_still_gated_on_percentages(tmp_path: Path) -> None:
-    """Upgrading must not silently drop the standard an old file recorded."""
-    path = tmp_path / ".coverage-baseline.json"
-    path.write_text(
-        json.dumps({"total": 50.0, "measured": 100, "files": {"a.py": 90.0}})
-    )
-
-    baseline = read_baseline(path)
-
-    assert baseline["files"]["a.py"] == 90.0
-    assert find_regressions(make_report({"a.py": 80.0}), baseline)
-    assert not find_regressions(make_report({"a.py": 95.0}), baseline)
-
-
-def test_a_legacy_entry_is_upgraded_on_the_next_write() -> None:
-    """Sizes can only start being recorded on a run that has them to record."""
-    report = make_report({"a.py": Counts(missing=1, measured=10)})
-
-    updated = raise_baseline(report, make_legacy_baseline({"a.py": 50.0}))
-
-    assert updated["files"]["a.py"] == Counts(missing=1, measured=10)
-
-
-def test_a_legacy_entry_cannot_have_its_size_compared() -> None:
-    """With no recorded size, a shrunk file falls back to the ratio.
-
-    Being stricter than necessary for one run is the safe direction: the write
-    that follows records the size and the next run gets the full treatment.
-    """
-    report = make_report({"a.py": Counts(missing=1, measured=8)})
-
-    assert find_regressions(report, make_legacy_baseline({"a.py": 90.0}))
-
-
-def test_a_legacy_floor_is_held_when_the_run_dipped_within_tolerance() -> None:
-    """The slow-leak guard, for an entry that has no counts to hold instead.
-
-    The gate passes inside EPSILON, so without this the sliver would be
-    written in and quietly become the new standard.
-    """
-    report = make_report({"a.py": Counts(missing=1, measured=1000)})  # 99.9%
-
-    updated = raise_baseline(report, make_legacy_baseline({"a.py": 99.905}))
-
-    assert updated["files"]["a.py"] == 99.905
-
-
-def test_a_held_legacy_floor_is_written_back_as_a_rounded_percentage(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "entry",
+    [
+        pytest.param(90.0, id="a bare percentage, as written before v0.3.0"),
+        pytest.param("most of it", id="not a number at all"),
+        pytest.param([1], id="a pair with a piece missing"),
+    ],
+)
+def test_an_unreadable_baseline_entry_is_rejected(
+    tmp_path: Path, entry: object
 ) -> None:
-    """Holding such a floor means writing it in the only form it has.
-
-    Rounded to two places like the total, so the committed file does not carry
-    a full float expansion into every diff.
-    """
     path = tmp_path / ".coverage-baseline.json"
-    write_baseline(path, make_legacy_baseline({"a.py": 12.345}))
+    path.write_text(json.dumps({"files": {"a.py": entry}}))
 
-    assert json.loads(path.read_text())["files"]["a.py"] == 12.35
+    with pytest.raises(RatchetError, match=r"expected \[missing, measured\]"):
+        read_baseline(path)
 
 
-def test_an_unrecognised_baseline_entry_is_rejected(tmp_path: Path) -> None:
+def test_a_rejected_baseline_says_how_to_recover(tmp_path: Path) -> None:
+    """The file is committed, so the fix is not obvious without being told."""
     path = tmp_path / ".coverage-baseline.json"
-    path.write_text(json.dumps({"files": {"a.py": "most of it"}}))
+    path.write_text("{not json at all")
 
-    with pytest.raises(ValueError, match="unrecognised baseline entry"):
+    with pytest.raises(RatchetError, match="proofmark run"):
         read_baseline(path)
 
 

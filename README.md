@@ -61,9 +61,7 @@ still fails. It is only the arithmetic of the ratio that is forgiven.
 
 Sizes are why each file is recorded as `[missing, measured]` rather than a
 percentage; the percentage is derived from them, and is exact rather than
-rounded. A baseline written by an older proofmark is read as percentages and
-upgraded in place the next time it is written, so there is nothing to migrate
-by hand.
+rounded.
 
 ## Requirements
 

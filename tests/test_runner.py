@@ -56,6 +56,24 @@ def write_report(
     )
 
 
+def write_baseline_json(
+    config: Config, *, total: float, measured: int, files: dict[str, float]
+) -> None:
+    """Write a baseline in the committed form, from percentages a test can read."""
+    config.baseline.write_text(
+        json.dumps(
+            {
+                "total": total,
+                "measured": measured,
+                "files": {
+                    name: [round(SCALE * (100 - pct) / 100), SCALE]
+                    for name, pct in files.items()
+                },
+            }
+        )
+    )
+
+
 class RecordingRun:
     """Captures subprocess invocations instead of executing them."""
 
@@ -225,9 +243,7 @@ def test_pytest_is_the_command_that_runs(
 
 def test_gate_passes_when_coverage_holds(config: Config) -> None:
     write_report(config, total=50.0, measured=100, files={"a.py": 50.0})
-    config.baseline.write_text(
-        json.dumps({"total": 50.0, "measured": 100, "files": {"a.py": 50.0}})
-    )
+    write_baseline_json(config, total=50.0, measured=100, files={"a.py": 50.0})
 
     assert runner.check_ratchet(config, update=False) == 0
 
@@ -236,9 +252,7 @@ def test_gate_fails_on_a_per_file_drop(
     config: Config, capsys: pytest.CaptureFixture[str]
 ) -> None:
     write_report(config, total=50.0, measured=100, files={"a.py": 10.0})
-    config.baseline.write_text(
-        json.dumps({"total": 50.0, "measured": 100, "files": {"a.py": 90.0}})
-    )
+    write_baseline_json(config, total=50.0, measured=100, files={"a.py": 90.0})
 
     assert runner.check_ratchet(config, update=False) == 1
     assert "a.py" in capsys.readouterr().out
@@ -246,17 +260,15 @@ def test_gate_fails_on_a_per_file_drop(
 
 def test_gate_fails_on_a_total_drop(config: Config) -> None:
     write_report(config, total=10.0, measured=100, files={})
-    config.baseline.write_text(
-        json.dumps({"total": 90.0, "measured": 100, "files": {}})
-    )
+    write_baseline_json(config, total=90.0, measured=100, files={})
 
     assert runner.check_ratchet(config, update=False) == 1
 
 
 def test_check_mode_leaves_the_baseline_untouched(config: Config) -> None:
     write_report(config, total=90.0, measured=100, files={"a.py": 90.0})
-    original = json.dumps({"total": 50.0, "measured": 100, "files": {"a.py": 50.0}})
-    config.baseline.write_text(original)
+    write_baseline_json(config, total=50.0, measured=100, files={"a.py": 50.0})
+    original = config.baseline.read_text()
 
     runner.check_ratchet(config, update=False)
 
@@ -265,9 +277,7 @@ def test_check_mode_leaves_the_baseline_untouched(config: Config) -> None:
 
 def test_update_mode_raises_the_baseline(config: Config) -> None:
     write_report(config, total=90.0, measured=100, files={"a.py": 90.0})
-    config.baseline.write_text(
-        json.dumps({"total": 50.0, "measured": 100, "files": {"a.py": 50.0}})
-    )
+    write_baseline_json(config, total=50.0, measured=100, files={"a.py": 50.0})
 
     runner.check_ratchet(config, update=True)
 
@@ -338,9 +348,7 @@ def test_check_mode_fails_on_an_unrecorded_gain(
     config: Config, capsys: pytest.CaptureFixture[str]
 ) -> None:
     write_report(config, total=90.0, measured=100, files={"a.py": 90.0})
-    config.baseline.write_text(
-        json.dumps({"total": 50.0, "measured": 100, "files": {"a.py": 50.0}})
-    )
+    write_baseline_json(config, total=50.0, measured=100, files={"a.py": 50.0})
 
     assert runner.check_ratchet(config, update=False) == 1
 
@@ -352,9 +360,7 @@ def test_check_mode_fails_on_an_unrecorded_gain(
 def test_check_mode_fails_on_an_untracked_file(config: Config) -> None:
     """The case that let actual_data_munging rot: measured but never recorded."""
     write_report(config, total=50.0, measured=100, files={"a.py": 50.0, "new.py": 80.0})
-    config.baseline.write_text(
-        json.dumps({"total": 50.0, "measured": 100, "files": {"a.py": 50.0}})
-    )
+    write_baseline_json(config, total=50.0, measured=100, files={"a.py": 50.0})
 
     assert runner.check_ratchet(config, update=False) == 1
 
@@ -375,9 +381,7 @@ def test_check_mode_reports_a_missing_baseline(
 
 def test_check_mode_passes_on_a_current_baseline(config: Config) -> None:
     write_report(config, total=90.0, measured=100, files={"a.py": 90.0})
-    config.baseline.write_text(
-        json.dumps({"total": 90.0, "measured": 100, "files": {"a.py": 90.0}})
-    )
+    write_baseline_json(config, total=90.0, measured=100, files={"a.py": 90.0})
 
     assert runner.check_ratchet(config, update=False) == 0
 
@@ -385,10 +389,8 @@ def test_check_mode_passes_on_a_current_baseline(config: Config) -> None:
 def test_check_mode_tolerates_a_deleted_file(config: Config) -> None:
     """A stale entry for removed code is not a gain, and must not fail a push."""
     write_report(config, total=90.0, measured=80, files={"a.py": 90.0})
-    config.baseline.write_text(
-        json.dumps(
-            {"total": 90.0, "measured": 100, "files": {"a.py": 90.0, "gone.py": 100.0}}
-        )
+    write_baseline_json(
+        config, total=90.0, measured=100, files={"a.py": 90.0, "gone.py": 100.0}
     )
 
     assert runner.check_ratchet(config, update=False) == 0
@@ -397,9 +399,7 @@ def test_check_mode_tolerates_a_deleted_file(config: Config) -> None:
 def test_check_mode_tolerates_a_shrinking_codebase(config: Config) -> None:
     """Deleting poorly covered code raises the average without earning it."""
     write_report(config, total=95.0, measured=80, files={"a.py": 90.0})
-    config.baseline.write_text(
-        json.dumps({"total": 90.0, "measured": 100, "files": {"a.py": 90.0}})
-    )
+    write_baseline_json(config, total=90.0, measured=100, files={"a.py": 90.0})
 
     assert runner.check_ratchet(config, update=False) == 0
 
@@ -409,10 +409,8 @@ def test_a_regression_is_reported_alone(
 ) -> None:
     """A drop is the more serious finding; the staleness table would bury it."""
     write_report(config, total=50.0, measured=100, files={"a.py": 10.0, "b.py": 99.0})
-    config.baseline.write_text(
-        json.dumps(
-            {"total": 50.0, "measured": 100, "files": {"a.py": 90.0, "b.py": 50.0}}
-        )
+    write_baseline_json(
+        config, total=50.0, measured=100, files={"a.py": 90.0, "b.py": 50.0}
     )
 
     assert runner.check_ratchet(config, update=False) == 1
@@ -428,9 +426,7 @@ def test_check_mode_fails_on_a_total_the_files_do_not_explain(
     behind - and it still has to be brought up to date.
     """
     write_report(config, total=90.0, measured=100, files={"a.py": 90.0})
-    config.baseline.write_text(
-        json.dumps({"total": 50.0, "measured": 100, "files": {"a.py": 90.0}})
-    )
+    write_baseline_json(config, total=50.0, measured=100, files={"a.py": 90.0})
 
     assert runner.check_ratchet(config, update=False) == 1
     assert "out of date" in capsys.readouterr().out
@@ -439,9 +435,7 @@ def test_check_mode_fails_on_a_total_the_files_do_not_explain(
 def test_update_mode_records_instead_of_failing(config: Config) -> None:
     """The writing path answers staleness by fixing it, so it must not gate."""
     write_report(config, total=90.0, measured=100, files={"a.py": 90.0})
-    config.baseline.write_text(
-        json.dumps({"total": 50.0, "measured": 100, "files": {"a.py": 50.0}})
-    )
+    write_baseline_json(config, total=50.0, measured=100, files={"a.py": 50.0})
 
     assert runner.check_ratchet(config, update=True) == 0
 
