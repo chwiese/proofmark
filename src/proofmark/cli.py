@@ -29,7 +29,11 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--check",
         action="store_true",
-        help="verify the gates without updating the baseline (use in hooks)",
+        help=(
+            "apply the gates without raising the baseline on success; on "
+            "failure, still writes it to disk (unstaged) if it's behind, "
+            "ready to review and commit (use in hooks)"
+        ),
     )
     run.add_argument(
         "--mutants",
@@ -60,7 +64,8 @@ def _run(config: Config, *, check_only: bool, mutants: bool) -> int:
 
     Args:
         config: The resolved project configuration.
-        check_only: Verify without writing the baseline.
+        check_only: Don't raise the baseline on success; still write it on
+            failure, unstaged, if it's behind.
         mutants: Whether to run mutation testing afterwards.
 
     Returns:

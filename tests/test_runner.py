@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from proofmark import runner
+from proofmark import ratchet, runner
 from proofmark.config import Config
 from proofmark.ratchet import Regression, Unrecorded
 
@@ -303,9 +303,31 @@ def test_gate_fails_on_a_total_drop(config: Config) -> None:
     assert runner.check_ratchet(config, update=False) == 1
 
 
-def test_check_mode_leaves_the_baseline_untouched(config: Config) -> None:
+def test_check_mode_writes_the_raised_baseline_on_a_stale_gain(config: Config) -> None:
     write_report(config, total=90.0, measured=100, files={"a.py": 90.0})
     write_baseline_json(config, total=50.0, measured=100, files={"a.py": 50.0})
+
+    assert runner.check_ratchet(config, update=False) == 1
+
+    missing, measured = json.loads(config.baseline.read_text())["files"]["a.py"]
+    assert 100.0 * (measured - missing) / measured == 90.0
+
+
+def test_check_mode_leaves_the_baseline_untouched_when_current(config: Config) -> None:
+    write_report(config, total=50.0, measured=100, files={"a.py": 50.0})
+    write_baseline_json(config, total=50.0, measured=100, files={"a.py": 50.0})
+    original = config.baseline.read_text()
+
+    runner.check_ratchet(config, update=False)
+
+    assert config.baseline.read_text() == original
+
+
+def test_check_mode_leaves_the_baseline_untouched_on_a_regression(
+    config: Config,
+) -> None:
+    write_report(config, total=50.0, measured=100, files={"a.py": 10.0})
+    write_baseline_json(config, total=50.0, measured=100, files={"a.py": 90.0})
     original = config.baseline.read_text()
 
     runner.check_ratchet(config, update=False)
@@ -392,7 +414,7 @@ def test_check_mode_fails_on_an_unrecorded_gain(
 
     out = capsys.readouterr().out
     assert "a.py" in out
-    assert "proofmark run" in out
+    assert "git add" in out
 
 
 def test_check_mode_fails_on_an_untracked_file(config: Config) -> None:
@@ -413,8 +435,18 @@ def test_check_mode_reports_a_missing_baseline(
 
     out = capsys.readouterr().out
     assert "No baseline" in out
-    assert "proofmark check --update" in out
+    assert "git add" in out
     assert "a.py" not in out
+
+
+def test_check_mode_writes_a_missing_baseline(config: Config) -> None:
+    write_report(config, total=90.0, measured=100, files={"a.py": 90.0})
+
+    assert runner.check_ratchet(config, update=False) == 1
+
+    written = json.loads(config.baseline.read_text())
+    missing, measured = written["files"]["a.py"]
+    assert 100.0 * (measured - missing) / measured == 90.0
 
 
 def test_check_mode_passes_on_a_current_baseline(config: Config) -> None:
@@ -561,21 +593,18 @@ def test_unrecorded_table_marks_an_untracked_file(
     assert "(new)" in capsys.readouterr().out
 
 
-def test_unrecorded_table_leads_with_the_cheap_remedy(
-    capsys: pytest.CaptureFixture[str],
+def test_write_raised_baseline_names_the_commit_remedy(
+    config: Config, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The report on disk is the one these numbers came from.
+    """The baseline is already written by this point - only committing is left."""
+    write_report(config, total=90.0, measured=100, files={"a.py": 90.0})
+    baseline = ratchet.read_baseline(config.baseline)
+    report = ratchet.read_report(config.coverage_json)
 
-    Re-running the suite is wasted work, and re-measuring could land on
-    numbers other than the ones the table just showed.
-    """
-    runner._print_unrecorded(
-        [Unrecorded("a.py", 80.0, 90.0)], recorded_total=80.0, current_total=90.0
-    )
+    runner._write_raised_baseline(config, report, baseline)
 
     out = capsys.readouterr().out
-    assert "proofmark check --update" in out
-    assert out.index("check --update") < out.index("proofmark run")
+    assert "git add" in out
     assert ".coverage-baseline.json" in out
 
 

@@ -187,24 +187,23 @@ def _print_regressions(regressions: Sequence[ratchet.Regression]) -> None:
     )
 
 
-def _how_to_record(verb: str) -> str:
-    """Spell out the remedy for a baseline that has fallen behind.
+def _write_raised_baseline(config: Config, report: Report, baseline: Baseline) -> None:
+    """Write the raised baseline to disk, unstaged, and say how to commit it.
 
-    `check --update` leads because the report on disk is the one these numbers
-    were just read from - it records exactly what was reported, and costs
-    nothing. Every route to this message has already written that report.
-    `run` re-measures, which is what you want only if the tree has moved since.
+    Only called once the gate above has already failed for being stale, so
+    this never turns a real regression into a pass - it just saves typing
+    `check --update` to record numbers coverage.json already has.
 
     Args:
-        verb: How to open the sentence, "Record" or "Create".
-
-    Returns:
-        An indented block ready to print.
+        config: The resolved project configuration.
+        report: The current coverage report.
+        baseline: The committed baseline.
     """
-    return (
-        f"  {verb} it with: proofmark check --update, which records the\n"
-        f"  report already measured - or proofmark run to re-measure first.\n"
-        f"  Then commit {BASELINE_NAME}."
+    updated = ratchet.raise_baseline(report, baseline)
+    ratchet.write_baseline(config.baseline, updated)
+    print(
+        f"\n  {BASELINE_NAME} written - review it, then:\n"
+        f"    git add {BASELINE_NAME} && git commit"
     )
 
 
@@ -240,14 +239,18 @@ def _print_unrecorded(
         "\n  An unrecorded gain is protected by nothing: give it back later\n"
         "  and no gate will notice.\n"
     )
-    print(_how_to_record("Record"))
 
 
 def _check_staleness(config: Config, report: Report, baseline: Baseline) -> int:
     """Fail when the committed baseline understates the project.
 
-    Only reached in check mode. The updating path answers the same question by
-    writing the gain down, so it has nothing to complain about.
+    Only reached in check mode; the updating path answers the same question
+    by writing the gain down instead of complaining about it. This still
+    fails - a gain is not real until it is committed, and writing a file does
+    not do that by itself - but it writes the raised baseline before
+    returning, since the numbers are already fully determined by
+    coverage.json. What is left for the caller is a review and a `git add`,
+    not a second command re-deriving what was just reported.
 
     Args:
         config: The resolved project configuration.
@@ -259,28 +262,25 @@ def _check_staleness(config: Config, report: Report, baseline: Baseline) -> int:
     """
     if not config.baseline.exists():
         print("No baseline recorded yet - nothing is gating this project.\n")
-        print(_how_to_record("Create"))
-        return 1
+    else:
+        unrecorded = ratchet.find_unrecorded(report, baseline)
+        if unrecorded:
+            _print_unrecorded(
+                unrecorded,
+                recorded_total=baseline["total"],
+                current_total=report.total,
+            )
+        elif ratchet.total_unrecorded(report, baseline):
+            print(
+                f"{BASELINE_NAME} is out of date: total coverage is "
+                f"{report.total:.2f}%, but only {baseline['total']:.2f}% is "
+                f"recorded.\n"
+            )
+        else:
+            return 0
 
-    unrecorded = ratchet.find_unrecorded(report, baseline)
-    if unrecorded:
-        _print_unrecorded(
-            unrecorded,
-            recorded_total=baseline["total"],
-            current_total=report.total,
-        )
-        return 1
-
-    if ratchet.total_unrecorded(report, baseline):
-        print(
-            f"{BASELINE_NAME} is out of date: total coverage is "
-            f"{report.total:.2f}%, but only {baseline['total']:.2f}% is "
-            f"recorded.\n"
-        )
-        print(_how_to_record("Record"))
-        return 1
-
-    return 0
+    _write_raised_baseline(config, report, baseline)
+    return 1
 
 
 def check_ratchet(config: Config, *, update: bool) -> int:

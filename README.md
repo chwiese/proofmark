@@ -245,21 +245,22 @@ Commits pay for the tests and mutants of what they change; the whole suite and
 both coverage gates run on `git push`. A commit that stages no Python skips the
 commit hook entirely.
 
-The pre-push hook runs `--check`, which never writes the baseline — a pre-push
-hook cannot add a file to the commit you are already pushing. Instead it fails
-if the baseline is out of date. Without that it would report success while the
-recorded standard quietly stayed at whatever it was first seeded with, gating
-nothing.
+The pre-push hook runs `--check`. It can't add a file to the commit you are
+already pushing, so it still fails when the baseline is out of date — reporting
+success there would let the recorded standard quietly stay at whatever it was
+first seeded with, gating nothing. But since the failing run has already
+written `coverage.json`, `--check` writes the raised baseline to disk too,
+unstaged, before it exits: the numbers on the gate's own report and the
+numbers it just wrote are the same ones.
 
-Recovering costs one command and no second test run: the failing hook has
-already written `coverage.json`, so `proofmark check --update` records exactly
-the numbers it just showed you. Commit the baseline and push again.
+Recovering costs no command and no second test run: review the diff in
+`.coverage-baseline.json`, commit it, and push again.
 
 ## Use directly
 
 ```bash
 proofmark run             # run tests, apply gates, raise the baseline
-proofmark run --check     # verify without writing (what the pre-push hook runs)
+proofmark run --check     # gates without raising on success (what the pre-push hook runs)
 proofmark run --mutants   # also mutation-test the whole tree
 proofmark check           # gates only, against an existing coverage.json
 proofmark check --update  # gates only, raising the baseline
