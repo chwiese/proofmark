@@ -309,3 +309,10 @@ with a warning rather than failing.
 `proofmark run` writes `.coverage-baseline.json` from whatever coverage
 currently exists. Commit it. From then on the number can only go up — and until
 you do, `--check` fails rather than passing a project nothing is gating.
+
+## License
+
+proofmark is free software: you can redistribute it and/or modify it under
+the terms of the GNU Lesser General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option)
+any later version. See [LICENSE](LICENSE).
